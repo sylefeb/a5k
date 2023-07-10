@@ -1,0 +1,30 @@
+
+// Unit to start the ILI9341 LCD (mch2022 badge)
+unit lcd_init(
+  output uint1  initialized(0),
+  input  uint1  ready,
+  output uint1  valid,
+  output uint17 cmd_data,
+) {
+
+  // init sequence for full screen (ILI9341)
+  brom uint9 init_seq[21] = {
+    //v command or data
+    9h101, 9h111, 9h13a, 9h055, 9h136, 9h000, 9h113, 9h129,
+    9h12b, 9h000, 9h000, 9h001, 9h03f, 9h12a, 9h000, 9h000,
+    9h000, 9h0ef, 9h151, 9h000, 9h12c
+  };
+  // algorithm, autoruns
+  algorithm <autorun> {
+    // wait for lcd sync from system
+    // while (~lcd_mode) { }
+    // send init sequence
+    init_seq.addr = 0;
+    while (init_seq.addr != 21) {
+      cmd_data      =  {8b0,init_seq.rdata};
+      valid         = 1;
+      init_seq.addr = ready ? (init_seq.addr + 1) : init_seq.addr;
+    }
+    initialized = 1;
+  }
+}

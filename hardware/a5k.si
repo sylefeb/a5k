@@ -1,0 +1,880 @@
+// ---------------------------------------------
+//
+// @sylefeb 2021-01-10
+//
+// A hardware remake of:
+//
+//    Raw - Another World Interpreter
+//    Copyright (C) 2004 Gregory Montoir
+//    GNU General Public License v2
+//
+// This is the main SOC
+// - four 4bpp framebuffers (videopage)
+// - blitter
+// - rasterizer
+// - VM (see vm.si)
+//
+// ---------------------------------------------
+// https://github.com/sylefeb/Silice
+// MIT license, see LICENSE_MIT in Silice repo root
+// ---------------------------------------------
+
+$$if SIMULATION then
+$$verbose = nil
+$$end
+
+$$if ICE40 then
+import('./common/plls/icebrkr_50.v')
+import('./common/ice40_half_clock.v')
+import('./common/ice40_spram.v')
+$$end
+
+$$if SIMULATION then
+$include('./common/simulation_spram.si')
+$$end
+
+$$if MCH2022 then
+  // mch2022 badge
+  // psram
+  $include('./common/qpsram2x.si')
+  // screen
+  $include('./common/parallel_screen.si')
+  $include('lcd.si')
+  // buttons
+  import('./common/spi_buttons.v')
+  append('./common/ext/spi_dev_core.v')
+  append('./common/ext/spi_dev_proto.v')
+$$elseif ULX3S then
+  import('./common/ulx3s_50_25.v')
+  $include('./common/spiflash2x.si')
+  import('./common/passthrough.v')
+  $include('../common/hdmi.si')
+$$else
+  // simulation, icebreaker with pmod
+  $include('./common/vga.si')
+  $include('./common/spiflash2x.si')
+$$end
+
+$include('./common/clean_reset.si')
+
+// -------------------------
+
+$$if SIMULATION then
+
+import('./common/passthrough.v')
+
+unit pll(output  uint1 clock2x,
+         output  uint1 clock1x)
+{
+  uint2 counter(0);
+  always {
+    clock2x =  counter[0,1]; // x2 slower
+    clock1x = ~counter[1,1]; // x4 slower
+    counter =  counter + 1;
+  }
+}
+
+$$end
+
+
+// ---------------------------------------------
+// Interface for memory storing VM instructions
+
+group mem_io {
+  uint1      in_ready(0),
+  uint24     addr(0),
+  uint8      data(0),
+  uint1      data_available(0),
+  uint1      busy(1),
+}
+
+interface mem_user {
+  output in_ready,
+  output addr,
+  input  data,
+  input  data_available,
+  input  busy,
+}
+
+// --------------------------------------------------
+// A helper unit that converts the data available 2x pulse
+// into a high signal (allows to cross 2x => 1x since once
+// data starts coming, it comes at every 1x cycle
+// --------------------------------------------------
+
+unit adapterDataAvailable(
+  input     uint1 valid,
+  input     uint1 data_avail_pulse,
+  output(!) uint1 data_avail_high)
+{
+  always {
+    data_avail_high = ~valid ? 0 : (data_avail_high | data_avail_pulse);
+  }
+}
+
+// -------------------------
+// include the VM (in our case no longer a VM but truly a processor!)
+$include('vm.si')
+
+// -------------------------
+// Blitter!
+
+unit blitter(
+  input   uint1  start, // pulse high to start
+  output  uint1  busy(0),
+  output! uint16 src_addr,
+  input   uint4  src_data,
+  output! uint16 dst_addr,
+  output! uint4  dst_data,
+  output! uint1  dst_wenable,
+  input   uint1  enabled // in some cases the blitter reads from the front
+                         // buffer so we disallow blitter when video is active
+) {
+  uint16 count      = 0;
+  uint16 prev_count = 0;
+
+  always {
+    if (busy) {
+      if (start) {
+        __display("ERROR: blitter still busy");
+$$if SIMULATION then
+        __finish();
+$$end
+      }
+      if (prev_count == 63999) {
+        // __display("===== blitter stops =====");
+      }
+      // __display("blitter working, reading %d writing %d",count,prev_count);
+    }
+$$if SIMULATION then
+    if (start) {
+      // __display("===== blitter starts =====");
+    }
+$$end
+    busy        = start ? 1 : (prev_count == 63999 ? 0 : busy);
+    prev_count  = start ? 0 : (enabled ?  count      : prev_count);
+    count       = start ? 0 : (enabled ? (count + 1) : count);
+    src_addr    = count;
+
+    dst_addr    = prev_count; // we write what was read previous cycle
+    dst_data    = src_data;
+    dst_wenable = busy & enabled;
+  }
+
+}
+
+// -------------------------
+// Implements a video page on top of a SPRAM
+
+unit videopage(
+  input     uint16 addr,
+  output(!) uint4  rdata,
+  input     uint1  wenable,
+  input     uint4  wdata,
+) {
+$$if SIMULATION or ICE40 then
+
+$$if SIMULATION then
+  simulation_spram spram(
+$$else
+  ice40_spram spram(
+    clock    <: clock,
+$$end
+    addr     <: spram_addr,
+    data_in  <: spram_data_in,
+    wenable  <: spram_wenable,
+    wmask    <: spram_wmask
+  );
+
+  uint14 spram_addr    <: addr[2,14];
+  uint16 spram_data_in <: wdata << {addr[0,2],2b00};
+  uint4  spram_wmask   <: (1 << addr[0,2]);
+  uint1  spram_wenable <: wenable;
+  uint2  prev_addr(0);
+
+  always {
+    rdata           = spram.data_out >> {prev_addr,2b00};
+    prev_addr       = addr[0,2];
+  }
+
+$$elseif ULX3S then
+
+  bram uint4 pixels[$320*200$] = uninitialized;
+
+  always {
+    rdata          = pixels.rdata;
+    pixels.addr    = addr;
+    pixels.wenable = wenable;
+    pixels.wdata   = wdata;
+  }
+
+$$end
+}
+
+// -------------------------
+// Rasterizer!
+//
+// This is not a generic rasterizer, it is specialized to Another World
+// polygons which are pre-processed for simpler raster.
+//
+unit rasterizer(
+  input  uint1               start,     // pulse high to start
+  output uint1               busy(0),
+  simple_dualport_bram_port0 polygon,   // polygon data
+  input  uint6               polygon_numv,
+  input  uint10              polygon_bbw,
+  input  uint10              polygon_bbh,
+  input  int12               polygon_px,
+  input  int12               polygon_py,
+  input  uint5               polygon_color,
+  input  uint9               polygon_zoom,
+  output uint1               pix_wenable,
+  output uint16              pix_waddr, // pixel address to write to
+  output uint4               pix_palid, // pixel palette index to write
+  output uint16              src_addr,
+  input  uint4               src_data,
+  input  uint1  enabled // in some cases the blitter reads from the front
+                        // buffer so we disallow blitter when video is active)
+) {
+$$if SIMULATION then
+  uint32 cycle(0);
+$$end
+
+  brom uint17 inv_y[1024] = {
+    16384,16384,
+$$for y=2,1023 do
+    $16384//y$, // in Lua '//' is the integer division
+$$end
+  };
+
+  always_before {
+    pix_wenable = 0;
+    // color to write to output
+    pix_palid = polygon_color[4,1]
+            ? ((polygon_color[0,3] == 0 ? 4b1000 : 4b0000) | src_data)
+            : polygon_color;
+  }
+
+  algorithm <autorun> {
+
+    while (1) {
+
+      if (start) {
+
+        int12 x1  = polygon_px - __signed(polygon_bbw>>1); // TODO: go back to int16
+        int12 x2  = polygon_px + __signed(polygon_bbw>>1);
+        int12 y1  = polygon_py - __signed(polygon_bbh>>1);
+        int12 y2  = polygon_py + __signed(polygon_bbh>>1);
+
+$$if SIMULATION then
+        //if (!(polygon_bbw == 0 && polygon_bbh == 1 && polygon_numv == 4)) {
+        //  __display("[%d] POLYGON %d points px: %d py: %d bbw: %d bbh: %d %d -> %d %d -> %d color: %d zoom: %d",cycle,polygon_numv,polygon_px,polygon_py,polygon_bbw,polygon_bbh,x1,x2,y1,y2,polygon_color,polygon_zoom);
+        //}
+$$end
+
+$$if SIMULATION then
+      	if (!(x1 > 319 || x2 < 0 || y1 > 199 || y2 < 0))
+$$end
+        {
+
+        busy      = 1;
+        uint6 n   = polygon_numv;
+$$if SIMULATION then
+        // __display("[%d] ======================> rasterizer started",cycle);
+$$end
+        uint32 p_i(0); // x:16,16 y:0,16 // NOTE: could be smaller ...
+        uint32 p_i_m1(0);
+        uint32 p_j(0);
+        uint32 p_j_p1(0);
+
+        // This below is a direct rip-off of video.cpp from the AnotherWorld
+        // source code repo ... feeling lazy tonight :)
+      	uint6 i = 0;
+	      uint6 j = n - 1;
+
+        polygon.addr0 = i;
+++:
+        p_i = polygon.rdata0;
+        polygon.addr0 = j;
+++:
+        p_j = polygon.rdata0;
+
+        p_i_m1 = p_i;
+        i      = i + 1;
+        p_j_p1 = p_j;
+        j      = j - 1;
+
+	      int12 init_cpt2 = __signed(p_i[16,12]) + x1;
+	      int12 init_cpt1 = __signed(p_j[16,12]) + x1;
+        int32 cpt2      = init_cpt2 << 16;
+        int32 cpt1      = init_cpt1 << 16;
+
+        while (y1 < 200) {
+
+          n = n - 2;
+          if (n == 0) { break; }
+
+          cpt1 = (cpt1 & 32hFFFF0000) | 32h7FFF;
+          cpt2 = (cpt2 & 32hFFFF0000) | 32h8000;
+
+          polygon.addr0 = i;
+++:
+          p_i    = polygon.rdata0;
+          polygon.addr0 = j;
+++:
+          p_j    = polygon.rdata0;
+
+          // calcStep
+          uint12 dy1   = __signed(p_j[ 0,12]) - __signed(p_j_p1[ 0,12]);
+          inv_y.addr   = dy1;
+++:
+          int12  dx1   = __signed(p_j[16,12]) - __signed(p_j_p1[16,12]);
+          int32  step1 = (dx1 * __signed(inv_y.rdata)) <<< 2;
+          // calcStep
+          uint12 dy    = __signed(p_i[ 0,12]) - __signed(p_i_m1[ 0,12]);
+          inv_y.addr   = dy;
+++:
+          int12  dx    = __signed(p_i[16,12]) - __signed(p_i_m1[16,12]);
+          int32  step2 = (dx * __signed(inv_y.rdata)) <<< 2;
+
+$$if SIMULATION then
+          //if (!(polygon_bbw == 0 && polygon_bbh == 1 && polygon_numv == 4)) {
+          //  __display("[%d] POLYGON n= %d y= %d step1: %d step2: %d",cycle,n,y1,step1,step2);
+          //}
+$$end
+
+          p_i_m1 = p_i;
+          i      = i + 1;
+          p_j_p1 = p_j;
+          j      = j - 1;
+
+          if (dy == 0) {
+            cpt1 = cpt1 + step1;
+            cpt2 = cpt2 + step2;
+          }
+
+          while (dy != 0 && y1 != 200) {
+            int12 sx1 = cpt1 >>> 16;
+            int12 sx2 = cpt2 >>> 16;
+            if (sx1 <= 319 && sx2 >= 0 && y1 >= 0) {
+              if (sx1 < __signed(0))   { sx1 =   0; }
+              if (sx2 > __signed(319)) { sx2 = 319; }
+$$if SIMULATION then
+              //if (!(polygon_bbw == 0 && polygon_bbh == 1 && polygon_numv == 4)) {
+              // __display("[%d] POLYGON span (%d) %d -> %d",cycle,y1,sx1,sx2);
+              //}
+$$end
+              uint16 base          = (y1<<8) + (y1<<6);
+              uint1  x1_smaller_x2 = (sx1 < sx2);
+              pix_waddr   = base + (x1_smaller_x2 ? sx1 : sx2);
+              uint16 stop = base + (x1_smaller_x2 ? sx2 : sx1) + 1;
+              // draw span (possibly with blending, could be faster without
+              //            but a single loop saves logic, we can afford it)
+++:             // one cycle added latency (registered outputs on src_*)
+              while (pix_waddr != stop) {
+                pix_wenable = 1; // write result (see pix_palid in always before)
+++:
+                pix_waddr   = enabled ? (pix_waddr + 1) : pix_waddr;
+++:             // one cycle added latency (registered outputs on src_*)
+              }
+            }
+            cpt1 = cpt1 + step1;
+            cpt2 = cpt2 + step2;
+            y1   = y1 + 1;
+            dy   = dy - 1;
+          }
+        }
+
+$$if SIMULATION then
+        // __display("[%d] ======================> rasterizer done",cycle);
+$$end
+        busy = 0;
+      }
+      }
+
+    }
+
+  }
+
+  always_after {
+    // read where we want to write (happens in two cycles since in same page)
+    src_addr = pix_waddr;
+$$if SIMULATION then
+    cycle    = cycle + 1;
+$$end
+  }
+
+}
+
+// -------------------------
+// Where everything is put together
+
+unit main(
+  output  uint$NUM_LEDS$    leds,
+$$if BUTTONS then
+  input   uint$NUM_BTNS$    btns,
+$$end
+$$if EXTRAS then
+  inout   uint5             extras,
+$$end
+$$if VGA then
+  output! uint$color_depth$ video_r,
+  output! uint$color_depth$ video_g,
+  output! uint$color_depth$ video_b,
+  output  uint1             video_hs,
+  output  uint1             video_vs,
+$$end
+$$if HDMI then
+  // video
+  output! uint4 gpdi_dp,
+$$end
+$$if LCD then
+  output uint8 lcd_d,
+  output uint1 lcd_rs,
+  output uint1 lcd_wr_n,
+  output uint1 lcd_cs_n(0),
+  output uint1 lcd_rst_n(1),
+  input  uint1 lcd_mode,
+  input  uint1 lcd_fmark,
+$$end
+$$if QSPIFLASH then
+  output  uint1 sf_clk,
+  output  uint1 sf_csn,
+  inout   uint1 sf_io0,
+  inout   uint1 sf_io1,
+  inout   uint1 sf_io2,
+  inout   uint1 sf_io3,
+$$end
+$$if PSRAM then
+  output  uint1 ram_clk,
+  output  uint1 ram_csn,
+  inout   uint1 ram_io0,
+  inout   uint1 ram_io1,
+  inout   uint1 ram_io2,
+  inout   uint1 ram_io3,
+$$end
+$$if MCH2022 then
+  input  uint1 espspi_mosi,
+  output uint1 espspi_miso,
+  input  uint1 espspi_clk,
+  input  uint1 espspi_cs_n,
+  output uint1 espirq_n,
+$$end
+$$if SIMULATION then
+  output uint1  video_clock,
+$$end
+$$if UART then
+  input   uint1 uart_rx,
+  output  uint1 uart_tx,
+$$end
+)
+$$if ICE40 then
+<@clock1x,!rst> {
+  uint1 clock2x = uninitialized;
+  pll _(
+    clock_in  <: clock,
+    clock_out :> clock2x,
+  );
+  uint1 clock1x  = uninitialized;
+  ice40_half_clock _(
+    clock_in  <: clock2x,
+    clock_out :> clock1x,
+  );
+$$elseif ULX3S then
+<@clock1x,!rst> {
+  uint1 clock1x = uninitialized;
+  uint1 clock2x = uninitialized;
+  pll_50_25 _(
+    clkin   <: clock,
+    clkout1 :> clock1x,
+    clkout0 :> clock2x,
+  );
+$$elseif SIMULATION then
+<@clock1x,!rst> {
+  uint1 clock1x = uninitialized;
+  uint1 clock2x = uninitialized;
+  pll _<@clock>(
+    clock1x :> clock1x,
+    clock2x :> clock2x,
+  );
+  passthrough psclk(inv <: clock1x, outv :> video_clock);
+  uint32 cycle(0);
+$$else
+{
+$$end
+
+  uint1 rst(1);
+  clean_reset _<@clock1x,!reset>(out :> rst);
+
+  // ---- palette, two of them so we can swap
+  simple_dualport_bram uint16 palette[32] = uninitialized;
+
+  // ---- display controllers
+  uint1 vblank(0); // high in frame border
+$$if VGA then
+  // vga
+  vga  video;
+$$elseif HDMI then
+  // hdmi
+  uint6 video_r(0); uint6 video_g(0); uint6 video_b(0);
+  uint8 v_r <: {video_r,1b0};
+  uint8 v_g <: {video_g,1b0};
+  uint8 v_b <: {video_b,1b0};
+  hdmi video(gpdi_dp :> gpdi_dp, red <: v_r, green <: v_g, blue <: v_b);
+$$elseif MCH2022 then
+  // screen
+  uint17 pix_in_data(0);
+  uint1  pix_valid(0);
+  uint17 ctrl_in_data <:: screen_init.initialized ? pix_in_data
+                                                  : screen_init.cmd_data;
+  uint1  ctrl_valid   <:: screen_init.initialized ? pix_valid
+                                                  : screen_init.valid;
+  screen_controller screen(
+    in_data      <: ctrl_in_data,
+    valid        <: ctrl_valid,
+    screen_ready <: screen_driver.ready
+  );
+  screen_driver     screen_driver(
+    valid            <: screen.screen_valid,
+    data_or_command  <: screen.send_dc,
+    byte             <: screen.send_byte,
+    screen_d         :> lcd_d,
+    screen_dc        :> lcd_rs,
+    screen_wrn       :> lcd_wr_n
+  );
+  lcd_init screen_init(
+    ready    <: screen.ready,
+  );
+  // buttons
+  spi_buttons btns(
+    clk      <: clock1x,    resetq   <: reset,
+    spi_mosi <: espspi_mosi,  spi_miso :> espspi_miso,
+    spi_clk  <: espspi_clk,   spi_cs_n <: espspi_cs_n,
+    irq_n    :> espirq_n,
+  );
+$$end
+
+	// ---- VM memory interface
+	mem_io mem_vm;
+$$if not MCH2022 then
+  // ---- SPIflash controller
+	spiflash_rom_core rom<@clock2x,reginputs> (
+		sf_clk  :> sf_clk,    sf_csn  :> sf_csn,
+		sf_io0 <:> sf_io0,    sf_io1 <:> sf_io1,
+		sf_io2 <:> sf_io2,    sf_io3 <:> sf_io3,
+	);
+$$else
+  // ---- SPImemory controller
+  qpsram_ram        rom<@clock2x,reginputs> (
+    ram_clk  :> ram_clk,  ram_csn :>  ram_csn,
+    ram_io0 <:> ram_io0,  ram_io1 <:> ram_io1,
+    ram_io2 <:> ram_io2,  ram_io3 <:> ram_io3,
+  );
+$$end
+	// adapts the data available pulse across clock domains
+	adapterDataAvailable _<@clock2x>(
+	  valid            <: mem_vm.in_ready,
+		data_avail_pulse <: rom   .rdata_available,
+		data_avail_high  :> mem_vm.data_available
+	);
+$$if SIMULATION then
+  // for simulation, create dummy vars to replace pins
+  uint1 sf_csn(1);  uint1 sf_clk(0);  uint1 sf_io0(0);
+  uint1 sf_io1(0);  uint1 sf_io2(0);  uint1 sf_io3(0);
+$$end
+
+  // ---- polygon storage
+  simple_dualport_bram uint32 polygon[64] = uninitialized;
+
+  // ---- high when rasterizer/blitter cannot write to videopage
+  uint1 display_conflict(0);
+  uint1 no_display_conflict <:: (~display_conflict) | vblank;
+
+  // ---- rasterizer
+  uint1 one(1);
+  rasterizer rast(
+     start        <:  vm.rasterizer_start,
+     busy          :> vm.rasterizer_busy,
+     polygon      <:> polygon,
+     polygon_numv <:  vm.polygon_numv,
+     polygon_bbw  <:  vm.polygon_bbw,
+     polygon_bbh  <:  vm.polygon_bbh,
+     polygon_px   <:  vm.polygon_px,
+     polygon_py   <:  vm.polygon_py,
+     polygon_color<:  vm.polygon_color,
+     polygon_zoom <:  vm.polygon_zoom,
+     enabled      <:  no_display_conflict,
+  );
+
+  // ---- 'virtual machine'
+  uint1 vm_reset(0);
+  vm vm<!vm_reset>( mem     <:> mem_vm,
+                    polygon <:> polygon,
+                    palette <:> palette,
+$$if SIMULATION then
+                    vblank  <: one, // override for fast albeit incorrect result
+$$else
+                    vblank  <:: vblank,
+$$end
+$$if UART then
+                    uart_rx <: uart_rx,
+                    uart_tx :> uart_tx,
+$$end
+                    jstick  <:: jstick
+        );
+
+  // ---- video pages
+  videopage page0;
+  videopage page1;
+  videopage page2;
+  videopage page3;
+
+  // ---- blitter
+  blitter blit( enabled  <: no_display_conflict );
+
+  // ---- joystick status
+  uint6 jstick(0);
+
+  /// always logic
+  always_before {
+
+$$if BUTTONS then
+    vm_reset ::= btns[1,1];
+    //          ^^ assigns with a register in the path (registers button)
+$$end
+
+$$if VGA then
+    video_hs = video.vga_hs; // output hs
+    video_vs = video.vga_vs; // output vs
+$$elseif MCH2022 then
+    rom.wenable  = 0;
+    pix_valid    = 0;
+$$end
+$$if VGA or HDMI then
+    vblank   = video.vblank; // track vblank in variable (simplifies writing)
+    video_r  = 0; video_g = 0; video_b = 0; // default RGB to blank
+$$end
+
+    // ---- connect VM memory interface to SPIflash controller ----
+		rom.in_ready = mem_vm.in_ready;
+		rom.addr     = mem_vm.addr;
+		mem_vm.data  = rom.rdata;
+		mem_vm.busy  = rom.busy;
+
+    // ---- video pages defaults to reading ----
+    page0.wenable = 0; page1.wenable = 0;
+    page2.wenable = 0; page3.wenable = 0;
+
+    // ---- blitter ----
+    blit.start      = vm.blitter_start;
+    vm.blitter_busy = blit.busy;
+
+    // NOTE: no conflict blitter <-> rasterizer, both cannot be busy together
+
+    // ---- video page arbiter ----
+    // blitter and rasterizer sources
+    blit.src_data = (vm.blitter_src == 3b000 ? page0.rdata      : 0)
+                  | (vm.blitter_src == 3b001 ? page1.rdata      : 0)
+                  | (vm.blitter_src == 3b010 ? page2.rdata      : 0)
+                  | (vm.blitter_src == 3b011 ? page3.rdata      : 0)
+                  | (vm.blitter_src == 3b100 ? vm.blitter_color : 0);
+    rast.src_data = (vm.rasterizer_dst == 2b00 ? page0.rdata    : 0)
+                  | (vm.rasterizer_dst == 2b01 ? page1.rdata    : 0)
+                  | (vm.rasterizer_dst == 2b10 ? page2.rdata    : 0)
+                  | (vm.rasterizer_dst == 2b11 ? page3.rdata    : 0);
+    if (vm.polygon_color[0,5] > 16) {rast.src_data = page0.rdata;} // drawLineP
+    page0.addr = rast.busy ? rast.src_addr : blit.src_addr;
+    page1.addr = rast.busy ? rast.src_addr : blit.src_addr;
+    page2.addr = rast.busy ? rast.src_addr : blit.src_addr;
+    page3.addr = rast.busy ? rast.src_addr : blit.src_addr;
+    // ---- outputs ---- (only one of blitter, rasterize, vm writes at once)
+    uint16 waddr  = (rast.pix_wenable ? rast.pix_waddr : 0)
+                  | (vm.pix_wenable   ? vm.pix_waddr   : 0)
+                  | (blit.dst_wenable ? blit.dst_addr  : 0);
+    uint4  wdata  = (rast.pix_wenable ? rast.pix_palid : 0)
+                  | (vm.pix_wenable   ? vm.pix_palid   : 0)
+                  | (blit.dst_wenable ? blit.dst_data  : 0);
+    uint1  wen    = (rast.pix_wenable | vm.pix_wenable | blit.dst_wenable);
+    uint2  wpage  = (rast.pix_wenable ? vm.rasterizer_dst : 0)
+                  | (vm.pix_wenable   ? vm.rasterizer_dst : 0)
+                  | (blit.dst_wenable ? vm.blitter_dst    : 0);
+    if (wen) {
+      switch (wpage) {
+        case 0:  {page0.wenable = 1; page0.addr = waddr; page0.wdata = wdata;}
+        case 1:  {page1.wenable = 1; page1.addr = waddr; page1.wdata = wdata;}
+        case 2:  {page2.wenable = 1; page2.addr = waddr; page2.wdata = wdata;}
+        case 3:  {page3.wenable = 1; page3.addr = waddr; page3.wdata = wdata;}
+      }
+    }
+    display_conflict = (vm.blitter_src[0,1] ^ vm.blitter_src[1,1])  // reading from page 1/2
+                     & (vm.page_swap        ^ vm.blitter_src[1,1]); // from displayed page
+
+    // leds = {vm.pal_swap,rast.pix_wenable,blit.dst_wenable,vm.pix_wenable,vm.page_swap};
+    // leds = jstick;
+    // leds = vm.leds;
+    // leds = {1b0,rom.in_ready,rom.busy};
+    leds = 0;
+
+$$if SIMULATION then
+    if (rast.busy & blit.busy) {
+      __display("**** conflict 1 ****");
+      __finish();
+    }
+    if (rast.pix_wenable & blit.dst_wenable) {
+      __display("**** conflict 2 ****");
+      __finish();
+    }
+    if (rast.pix_wenable & vm.pix_wenable) {
+      __display("**** conflict 3 ****");
+      __finish();
+    }
+    if (blit.dst_wenable & vm.pix_wenable) {
+      __display("**** conflict 4 **** (blitter busy:%b)",blit.busy);
+      __finish();
+    }
+    uint2 display_page = vm.page_swap ? 2b01 : 2b10;
+    if (display_conflict) {
+      //__display("[%d] **** display conflict **** (display page %b, blitter_src %b, vblank %b)",cycle,display_page,vm.blitter_src[0,2],vblank);
+    }
+    if (rast.busy && (display_page == vm.rasterizer_dst)) {
+      // __display("**** conflict 5 **** (raster to display, page %b)",display_page);
+    }
+    if (blit.busy && (display_page == vm.blitter_dst)) {
+      // __display("**** conflict 6 **** (blitter to display, page %b)",display_page);
+    }
+    if (blit.busy && (display_page == vm.blitter_src[0,2])) {
+      // __display("**** conflict 7 **** (blitter from display, page %b)",display_page);
+    }
+$$end
+  }
+
+  /// algorithm
+  algorithm {
+
+    uint10 x(0); uint10 y(0);
+
+$$if MCH2022 then
+    // wait for screen init to be completed
+    while (~screen_init.initialized) { }
+    uint8 scry(0); uint1 above(1); uint1 below(0); // top/bottom bars
+$$else
+    uint1 below(0); // bottom bar
+$$end
+
+$$if VGA or HDMI then
+    while (~vblank) { } // wait end of display to sync pipeline
+$$end
+
+    while (1) { // generate on-screen image from pages 1 and 2
+
+$$if VGA or HDMI then
+        // ------------------- Pipeline to generate VGA/HDMI signal
+        // we use a pipeline for looking up framebuffer => palette => screen
+        $$if VGA then H_START = 160 else H_START = 0 end
+        $$H_END         = 800
+        below           = (y == 0) ? 0 : ((y == 399) ? 1 : below);
+        // lookup next pixel
+        uint10 vx       = x - $H_START$;
+        uint16 addr     = vx[1,9] + (y[1,8]<<8) + (y[1,8]<<6); // x+y*320
+        if (vm.page_swap) {
+          page1.addr    = addr;
+          page1.wenable = 0;
+        } else {
+          page2.addr    = addr;
+          page2.wenable = 0;
+        }
+        // increment coordinates
+        y            = x == $H_END-1$ ? (y == 479 ? 0 : (y+1)) : y;
+        x            = x == $H_END-1$ ? 0 : (x + 1);
+      ->  // next pipeline stahe
+        // lookup next pixel palette
+        palette.addr0  = {vm.pal_swap,4b000}
+                       | (vm.page_swap ? page1.rdata : page2.rdata);
+      ->  // next pipeline stahe
+        uint8 c1 = palette.rdata0[ 0,8];
+        uint8 c2 = palette.rdata0[ 8,8];
+        if (~vblank) {
+          // video active, update RGB from lookuped up values
+          video_r = (~below & video.active) ? {c1[ 0,4],c1[ 2,2]} : 0;
+          video_g = (~below & video.active) ? {c2[ 4,4],c2[ 6,2]} : 0;
+          video_b = (~below & video.active) ? {c2[ 0,4],c2[ 2,2]} : 0;
+        } else {
+          // stall the pipeline when video is blanked
+          stall; // pipeline waits (all stages stalled)
+        }
+$$elseif MCH2022 then
+        // ------------------- Sending to a SPI/parallel screen
+        $$if not MCH2022 and not SIMULATION then
+          $$error('For now this design only works with the icebreaker (VGA PMOD) and MCH2022 badge')
+        $$end
+        // ----- Sends pixels to the SPI screen
+        // deal with top/bottom borders
+        scry   = above    ? 0 : (scry + 1);
+        above  = (y == 0) ? 1 : ((y ==  19) ? 0 : above);
+        below  = (y == 0) ? 0 : ((y == 219) ? 1 : below);
+        vblank = (below | above); // artificially produces a vblank
+        // pixel address
+        uint16 addr = x[0,9] + (scry[0,8]<<8) + (scry[0,8]<<6); // x+y*320
+        if (~vblank) {  // <------  do not manipulate address during vblank,
+          if (vm.page_swap) { //    so that blitter and rasterizer can.
+            page1.addr    = addr;
+            page1.wenable = 0;
+          } else {
+            page2.addr    = addr;
+            page2.wenable = 0;
+          }
+        }
+        // increment coordinates
+        y      = y == 239 ? 0 : (y + 1);
+        x      = y == 239 ? (x == 319 ? 0 : (x+1)) : x;
+      ++:
+        // lookup next pixel palette
+        palette.addr0  = {vm.pal_swap,4b000}
+                       | (vm.page_swap ? page1.rdata : page2.rdata);
+        // wait for screen ready (1 cycle at least, looks up palette)
+        while (!screen.ready) { }
+        // send to screen
+        uint8 c1    = palette.rdata0[ 0,8];
+        uint8 c2    = palette.rdata0[ 8,8];
+        uint6 r     = (above|below) ? 0 : {c1[ 0,4],c1[ 2,2]};
+        uint6 g     = (above|below) ? 0 : {c2[ 4,4],c2[ 6,2]};
+        uint6 b     = (above|below) ? 0 : {c2[ 0,4],c2[ 2,2]};
+        pix_in_data = {1b1,{g[0,3],r[1,5],b[1,5],g[3,3]}};
+        pix_valid   = 1;
+$$end
+
+    }
+  }
+
+  always_after {
+$$if EXTRAS then
+    // ---- icebreaker with hacks to plug-in an Amiga joystick
+    // configure all pins as inputs
+    extras.oenable = 5b00000;
+    // read status in register
+    uint5 js = ~extras.i[0,5];
+    jstick   = {1b0,js[2,1],js[0,1],js[1,1],js[3,1],js[4,1]};
+    //              Fire    Down    Up      Left    Right
+$$elseif ULX3S and BUTTONS then
+    jstick   = {1b0,btns[2,1],btns[4,1],btns[3,1],btns[5,1],btns[6,1]};
+    //              Fire      Down      Up        Left      Right
+$$elseif MCH2022 then
+    // ---- mch2022 badge
+    // read buttons
+    jstick   = {btns.back,btns.accept,
+                btns.joystick_down,btns.joystick_up,
+                btns.joystick_left,btns.joystick_right};
+$$elseif SIMULATION then
+   // ---- simulation
+    if (cycle < 70217342) {
+      jstick = {1b0,1b0/*f*/,1b0/*d*/,1b1/*u*/,1b0/*l*/,1b0/*r*/};
+    } else {
+      jstick = {1b0,1b0/*f*/,1b0/*d*/,1b0/*u*/,1b0/*l*/,1b1/*r*/};
+    }
+    cycle = cycle + 1;
+$$end
+  }
+
+}
+
+// -------------------------

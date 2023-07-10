@@ -1,0 +1,1065 @@
+// ---------------------------------------------
+//
+// @sylefeb 2021-01-10
+//
+// A hardware remake of:
+//
+//    Raw - Another World Interpreter
+//    Copyright (C) 2004 Gregory Montoir
+//    GNU General Public License v2
+//
+// ---------------------------------------------
+// https://github.com/sylefeb/Silice
+// MIT license, see LICENSE_MIT in Silice repo root
+// ---------------------------------------------
+
+$$ENABLE_GAMESTATE_EXPERIMENT = nil
+// ^^^^^^ This option enables an experiment on the mch2022 badge to
+// stop and resume seamlessly after reprogramming the FPGA. It works
+// but the framebuffers are not preserved
+// - Button B is pressed to stop the game
+// - The FPGA is reprogrammed with a bitstreamed generated using 'icepack -n'
+// - The game will resume, but with graphical glitches
+//
+// TODO: save the framebuffers and restore them using the pre-renderered
+//       buffer mechanism.
+
+$$uart_in_clock_freq_mhz = 25
+$include('../common/uart.si')
+
+// ---------------------------------------------
+// Helper circuitries
+
+// reads next pre-loaded byte, advances address
+circuitry nextByte(inout rom,inout buf,output byte)
+{
+  byte     = buf.rdata;
+	rom.addr = rom.addr + 1;
+  buf.addr = buf.addr + 1;
+++:
+}
+
+// reads next pre-loaded 16-bits word, advances address
+circuitry nextWord(inout rom,inout buf,output word)
+{
+  word[8,8] = buf.rdata;
+	rom.addr  = rom.addr + 2;
+  buf.addr  = buf.addr + 1;
+++:
+  word[0,8] = buf.rdata;
+  buf.addr  = buf.addr + 1;
+++:
+}
+
+// reads a byte from memory, advances address
+circuitry readByte(inout mem)
+{
+  mem.in_ready = 1;
+++: // wait one cycle before checking busy (registers in the path)
+  while (mem.busy) { mem.in_ready = 0; }
+  mem.addr     = mem.addr + 1;
+}
+
+// ---------------------------------------------
+
+$include('data.si')
+
+// ---------------------------------------------
+
+unit vm(
+  // blitter
+  output uint1  blitter_start,
+  input  uint1  blitter_busy,
+  output uint3  blitter_src,
+  output uint2  blitter_dst,
+  output uint4  blitter_color,
+  // page swap to select between bkg buffer
+  output uint1  page_swap(0),
+  input  uint1  vblank,
+  // polygon rasterizer
+  simple_dualport_bram_port1 polygon,
+  output uint6  polygon_numv,
+  output uint10 polygon_bbw,
+  output uint10 polygon_bbh,
+  output int12  polygon_px,
+  output int12  polygon_py,
+  output uint5  polygon_color,
+  output uint9  polygon_zoom,
+  output uint1  rasterizer_start,
+  input  uint1  rasterizer_busy,
+  output uint2  rasterizer_dst,
+  // direct write for text
+  output uint16 pix_waddr,
+  output uint1  pix_wenable,
+  output uint4  pix_palid,
+  // palette
+  simple_dualport_bram_port1 palette,
+  output uint1  pal_swap(0),
+  // memory
+	mem_user      mem,
+  // joystick
+  input uint6   jstick,
+  // leds
+  output uint8  leds,
+$$if UART then
+  // uart (DEBUG)
+  input   uint1 uart_rx,
+  output  uint1 uart_tx,
+$$end
+)
+{
+  $$if SIMULATION then
+  uint32 cycle(0);
+  $$end
+
+  $$if UART then
+  // UART sender
+  uart_out uo;
+  uart_sender usend(
+    io      <:> uo,
+    uart_tx :>  uart_tx
+  );
+  $$end
+
+	bram uint8 data[64] = uninitialized; // TODO: adjust size
+
+  uint17 segBytecode ($segBytecode$);
+  uint17 segPalettes ($segPalettes$);
+  uint17 segCinematic($segCinematic$);
+  uint17 segVideo2   ($segVideo2$);
+
+  uint1  next_palette(1);
+
+$$VM_NUM_VARIABLES  = 256
+
+$$VM_NUM_THREADS    = 64
+$$NUM_THREAD_FIELDS = 2
+$$NUM_DATA_FIELDS   = 2
+
+$$VM_VARIABLE_RANDOM_SEED          = 0x3C
+$$VM_VARIABLE_LAST_KEYCHAR         = 0xDA
+$$VM_VARIABLE_HERO_POS_UP_DOWN     = 0xE5
+$$VM_VARIABLE_MUS_MARK             = 0xF4
+$$VM_VARIABLE_SCROLL_Y             = 0xF9
+$$VM_VARIABLE_HERO_ACTION          = 0xFA
+$$VM_VARIABLE_HERO_POS_JUMP_DOWN   = 0xFB
+$$VM_VARIABLE_HERO_POS_LEFT_RIGHT  = 0xFC
+$$VM_VARIABLE_HERO_POS_MASK        = 0xFD
+$$VM_VARIABLE_HERO_ACTION_POS_MASK = 0xFE
+$$VM_VARIABLE_PAUSE_SLICES         = 0xFF
+
+$$PC_OFFSET           = 0
+$$REQUESTED_PC_OFFSET = 1
+
+$$CURR_STATE          = 0
+$$REQUESTED_STATE     = 1
+
+$$VM_NO_SETVEC_REQUESTED = 0xffff
+$$VM_INACTIVE_THREAD     = 0xffff
+
+$$ varsInit = {}
+$$ varsInit[0xBC] = 0x10
+$$ varsInit[0xC6] = 0x80
+$$ varsInit[0xF2] = 4000
+$$ varsInit[0xDC] = 33
+$$ varsInit[0x54] = 0x81
+$$ varsInit[VM_VARIABLE_RANDOM_SEED] = 42
+$$ varsInit[0xE4] = 0x14
+
+  bram int16  vmVars[$VM_NUM_VARIABLES$] = {
+$$for i=0,VM_NUM_VARIABLES-1 do
+$$  if varsInit[i] then
+    $varsInit[i]$,
+$$  else
+    0,
+$$  end
+$$end
+  };
+  bram uint8  vmIsChannelActive[$VM_NUM_THREADS*NUM_THREAD_FIELDS$] = {pad(0)}; // TODO: split in two or use dual?
+  //   ^^^^^ TODO: could use less
+  bram uint16 threadsData[$VM_NUM_THREADS*NUM_DATA_FIELDS$] = {pad(16hffff)};   // TODO: split in two or use dual?
+  bram uint16 scriptStackCalls[$VM_NUM_THREADS$] = {pad(0)};
+
+  $$N_stack = (1<<7)
+  bram uint$8+12+12+16$ polygonStack[$N_stack$] = uninitialized;
+
+  brom uint29 op_decode[256] = { // decodes op code into a onehot
+    $$for i=0,255 do
+      $$if i <= 26 then       -- VM opcodes
+        $$if i == 0x19 then   -- redirect h19 to h12
+          29d$(1<<0x12)$,
+        $$else
+          29d$(1<<i)$,
+        $$end
+      $$elseif (i & 0x80) ~= 0 then  --
+        29d$(1<<28)$,
+      $$elseif (i & 0x40) ~= 0 then  --
+        29d$(1<<27)$,
+      $$else
+        0,
+      $$end
+    $$end
+  };
+
+  uint1  gotoNextThread(0);
+
+  algorithm <autorun> {
+
+    // _________________________________________________________________________
+    //
+    // Subroutine reading polygons
+    //
+    // Implements the recursive traversal of the polygon hierarchy.
+    // _________________________________________________________________________
+    subroutine readPolygons(input int12 x,input int12 y,input uint9 zoom,
+                            input uint16 off,input uint1 useSegVideo2,
+                            readwrites mem,readwrites polygonStack,
+                            reads segVideo2, reads segCinematic,
+                            readwrites polygon,writes polygon_numv,
+                            writes polygon_bbw,writes polygon_bbh,
+                            writes polygon_px ,writes polygon_py,
+                            writes polygon_color,reads blitter_busy,writes polygon_zoom,
+                            reads rasterizer_busy,writes rasterizer_start,
+$$if SIMULATION then
+                            reads cycle,
+$$end
+                            ) {
+     // makes a small circuit to apply the zoom to read data
+     int16  zoomed <:: ({8b0,mem.data} * :zoom) >> 6;
+$$if SIMULATION then
+      //__display("[%d] readPolygons",cycle);
+$$end
+      // save memory address
+      sameas(mem.addr) before = mem.addr;
+      // push first on stack
+      polygonStack.wenable = 1;
+      polygonStack.wdata   = {8hff,x,y,off};
+      polygonStack.addr    = 0;
+++:
+      while (polygonStack.addr != $N_stack-1$) {
+        // pop stack
+        mem.addr          = polygonStack.rdata[ 0,16]
+                          + (useSegVideo2 ? segVideo2 : segCinematic);
+        uint8 color       = polygonStack.rdata[40, 8];
+        int16 ptx         = __signed(polygonStack.rdata[28,12]);
+        int16 pty         = __signed(polygonStack.rdata[16,12]);
+        polygonStack.addr = polygonStack.addr - 1;
+        // read type byte
+        (mem)    = readByte(mem);
+        if (mem.data >= 8hC0) {
+          // polygon
+          if (color[7,1]) {
+            color     = {2b0,mem.data[0,6]};
+          }
+          // read vertices
+          (mem)      = readByte(mem);
+          uint10 bbw = zoomed;
+          (mem)      = readByte(mem);
+          uint10 bbh = zoomed;
+          (mem)      = readByte(mem);
+          uint6 numPoints = mem.data;
+          while (rasterizer_busy | blitter_busy) { } // wait for ops to terminate
+$$if SIMULATION then
+          //__display("[%d] POLYGON @%x",cycle,mem.addr);
+$$end
+          polygon_bbw     = bbw;
+          polygon_bbh     = bbh;
+          polygon_px      = ptx;
+          polygon_py      = pty;
+          polygon_color   = color;
+          polygon_zoom    = zoom; // for debug only
+          // read points
+          polygon_numv    = numPoints;
+          polygon.addr1 = -1;
+          while (numPoints != 0) {
+            polygon.wenable1 = 0;
+            (mem)     = readByte(mem);
+            uint16 vx = zoomed;
+            (mem)     = readByte(mem);
+            uint16 vy = zoomed;
+            numPoints        = numPoints - 1;
+            polygon.wenable1 = 1;
+            polygon.addr1    = polygon.addr1 + 1;
+            polygon.wdata1   = {vx,vy};
+          }
+          polygon.wenable1 = 0;
+          // start the rasterizer
+          rasterizer_start = 1;
+        } else {
+          // hierarchy
+          (mem)      = readByte(mem);
+          int16 htx  = zoomed;
+          (mem)      = readByte(mem);
+          int16 hty  = zoomed;
+          (mem)      = readByte(mem);
+          uint8 nch  = mem.data;
+$$if SIMULATION then
+          //__display("hty:%d zoom:%d mul:%d",mem.data,zoom,hty);
+          //__display("[%d] hierarchy %d childs (stack @%d)",cycle,nch,polygonStack.addr);
+$$end
+          // apply translation
+          ptx        = ptx - htx;
+          pty        = pty - hty;
+          // for each child
+          sameas(polygonStack.addr) stack_ptr = polygonStack.addr + nch + 1;
+          polygonStack.addr = stack_ptr + 1;
+          while (~nch[7,1]) { // not -1
+            // read next polygon address
+            uint16 ch_off(0);
+            (mem)   = readByte(mem);
+            ch_off[8,8] = mem.data;
+            (mem)   = readByte(mem);
+            ch_off[0,8] = mem.data;
+            // read point
+            (mem)     = readByte(mem);
+            int16 ctx = ptx + __signed(zoomed);
+            (mem)     = readByte(mem);
+            int16 cty = pty + __signed(zoomed);
+            uint8 ch_color = 8hff;
+            if (ch_off[15,1]) {
+              (mem)    = readByte(mem);
+              ch_color = {1b0,mem.data[0,7]};
+              (mem)    = readByte(mem);
+            }
+            // push on stack
+            polygonStack.wenable = 1;
+            polygonStack.addr    = polygonStack.addr - 1;
+            uint16       addr    = (ch_off[0,15]<<1);
+            polygonStack.wdata   = {ch_color,ctx[0,12],cty[0,12],addr};
+$$if SIMULATION then
+            //__display("[%d] - child %d @%x, stack:%x, color:%d, px:%d, py:%d",cycle,nch,addr,polygonStack.addr,ch_color,ctx,cty);
+$$end
+            nch = nch - 1;
+          }
+          polygonStack.addr    = stack_ptr;
+        }
+      }
+      mem.addr = before;
+    }
+    // _________________________________________________________________________
+
+    // default VM brams to read
+    vmIsChannelActive.wenable := 0;
+    vmVars           .wenable := 0;
+    threadsData      .wenable := 0;
+    scriptStackCalls .wenable := 0;
+    polygonStack     .wenable := 0;
+    // maintain start pulses to low
+    blitter_start    := 0;
+    rasterizer_start := 0;
+$$if UART then
+    // uart
+    uo.data_in_ready := 0;
+$$end
+
+    leds = 0;
+    while (mem.busy) {} // will require pressing reset if commented
+    leds = 1;
+
+$$if SIMULATION then
+    __display("Hello Another World");
+$$end
+
+$$if ENABLE_GAMESTATE_EXPERIMENT then
+    vmVars.addr         = $VM_VARIABLE_HERO_POS_MASK$;
+++:
+    threadsData.wenable = vmVars.rdata == 16hA5A5 ? 0 : 1;
+    //                    ^^^^^^^ if sentinel ^^^ is present, skip thread init
+$$else
+    threadsData.wenable = 1;
+$$end
+    threadsData.addr    = {1b$PC_OFFSET$,6b0};
+    threadsData.wdata   = 0;
+
+    leds = 2;
+    // loop into code execution
+$$if ENABLE_GAMESTATE_EXPERIMENT then
+    while (~jstick[5,1]) { // stop if B pressed
+$$else
+    while (1) { // forever
+$$end
+
+    // checkThreadRequests
+    {
+      uint7 threadId = 0;
+      while (~threadId[6,1]) { // threadId < 64
+        // __display("checkThreadRequests, threadId %d",threadId);
+        vmIsChannelActive.addr  = {1b$REQUESTED_STATE$,    threadId[0,6]};
+        threadsData.addr        = {1b$REQUESTED_PC_OFFSET$,threadId[0,6]};
+  ++:
+        vmIsChannelActive.wenable = 1;
+        vmIsChannelActive.addr    = {1b$CURR_STATE$,     threadId[0,6]};
+        vmIsChannelActive.wdata   = vmIsChannelActive.rdata;
+        uint1 setvec = (threadsData.rdata != $VM_NO_SETVEC_REQUESTED$);
+        threadsData.wenable   = setvec;
+        threadsData.addr      = {1b$PC_OFFSET$,threadId[0,6]};
+        threadsData.wdata     = (threadsData.rdata == 16hfffe)
+                              ? $VM_INACTIVE_THREAD$
+                              : threadsData.rdata;
+  ++:
+        threadsData.wenable   = setvec;
+        threadsData.addr      = {1b$REQUESTED_PC_OFFSET$,threadId[0,6]};
+        threadsData.wdata     = $VM_NO_SETVEC_REQUESTED$;
+        threadId  = threadId + 1;
+      }
+    }
+
+    // inputs
+    uint16 lr = 0;
+    uint16 ud = 0;
+    uint16 m = {12b0,jstick[2,1],jstick[3,1],jstick[1,1],jstick[0,1]};
+    if (jstick[0,1]) { lr =  1; } // right
+    if (jstick[1,1]) { lr = -1; } // left
+    if (jstick[3,1]) { ud =  1; } // down
+    if (jstick[2,1]) { ud = -1; } // up
+    vmVars.addr    = $VM_VARIABLE_HERO_POS_UP_DOWN$;
+    vmVars.wenable = 1;
+    vmVars.wdata   = ud;
+++:
+    vmVars.addr    = $VM_VARIABLE_HERO_POS_JUMP_DOWN$;
+    vmVars.wenable = 1;
+    vmVars.wdata   = ud;
+++:
+    vmVars.addr    = $VM_VARIABLE_HERO_POS_LEFT_RIGHT$;
+    vmVars.wenable = 1;
+    vmVars.wdata   = lr;
+++:
+    vmVars.addr    = $VM_VARIABLE_HERO_POS_MASK$;
+    vmVars.wenable = 1;
+    vmVars.wdata   = m;
+++:
+    vmVars.wdata   = 0;
+    if (jstick[4,1]) {
+      m            = m | 16h80;
+      vmVars.wdata = 1;
+    }
+    vmVars.addr    = $VM_VARIABLE_HERO_ACTION$;
+    vmVars.wenable = 1;
+++:
+    vmVars.addr    = $VM_VARIABLE_HERO_ACTION_POS_MASK$;
+    vmVars.wenable = 1;
+    vmVars.wdata   = m;
+
+    leds = 3;
+
+    // hostFrame
+    {
+      uint7 threadId = 0;
+      while (~threadId[6,1]) { // threadId < 64
+        // __display("hostFrame, threadId %d",threadId);
+        vmIsChannelActive.addr  = {1b$CURR_STATE$, threadId[0,6]}; // NOTE: move at end, save a cycle
+        threadsData.addr        = {1b$PC_OFFSET$,  threadId[0,6]};
+++:
+        if ( vmIsChannelActive.rdata == 0
+          && threadsData.rdata != $VM_INACTIVE_THREAD$) {
+
+          // executeThread
+
+          mem.addr              = segBytecode + threadsData.rdata;
+          scriptStackCalls.addr = 0;
+          gotoNextThread        = 0;
+
+$$if SIMULATION then
+          //__display("hostFrame() i=0x%x n=0x%x",threadId,threadsData.rdata);
+$$end
+          {
+            while (~gotoNextThread)
+            {
+						  // ---- Fetch next instruction
+              // pre-loads data from mem (SPIflash) into data (BRAM)
+              // currently set to 64 bytes (TODO: adjust)
+              // once data pre-loaded, nextByte/nextWord are used to read it
+							//__display("====== ROM ======= reading from @%h",mem.addr);
+							mem.in_ready = 1; // start reading
+						  data.addr    = 0;
+              data.wenable = 0;
+							while (data.addr != 63) {
+							  data.addr    = data.wenable ? (data.addr + 1) : 0; // NOTE: move this to always_before?
+								data.wdata   = mem.data;
+								data.wenable = mem.data_available;
+							}
+							mem.in_ready = 0;
+              data.wenable = 0;
+							data.addr    = 0;
+							//__display("\n------------------ done reading from @%h",mem.addr);
+++:
+              uint8 opcode(0); // read opcode
+              (mem,data,opcode) = nextByte(mem,data);
+              leds = opcode;   // light show
+$$if SIMULATION then
+              // sanity check in simulation
+              if (opcode > 8h1a && ~opcode[7,1] && ~opcode[6,1]) {
+                __display("[%d] op_invalid %x FATAL",cycle,opcode);
+                __finish();
+              }
+$$end
+              // decode the opcode as a one-hot bitfield
+              // - reduces LUT count
+              // - enables tricks to redirect opcodes h19 to h12
+              //   (for pre-rendered framebuffers)
+              op_decode.addr = opcode;
+++: // op_decode lookup
+              sameas(op_decode.rdata) opd = op_decode.rdata;
+              onehot (opd) { // --- opcode switch
+                case 8d28: { // opcode & 0x80
+                  /// draw
+                  // fetch
+                  uint16 off(0);
+                  (mem,data,off) = nextByte(mem,data); // off
+                  off        = {opcode,off[0,8],1b0}; // ((opcode << 8) | _scriptPtr.nextByte()) * 2;
+                  int16 x(0);
+                  (mem,data,x)   = nextByte(mem,data); // x
+                  int16 y(0);
+                  (mem,data,y)   = nextByte(mem,data); // y
+                  int16 h    = y - 199;
+                  if (h > 0) {
+                    y = 199; x = x + h;
+                  }
+  $$if SIMULATION then
+                  //__display("[%d] op_Polygon (vid_opcd_0x80) @%x",cycle,off);
+  $$end
+                  () <- readPolygons <- (x,y,64,off,0);
+                  // continue
+                }
+                case 8d27: { // opcode & 0x40
+                  /// draw
+                  uint16 off(0);
+                  (mem,data,off) = nextWord(mem,data);
+                  off = off << 1;
+
+                  int16 x(0);
+                  (mem,data,vmVars.addr) = nextByte(mem,data);
+                  //        ^^^^^^^^^^^ This is a trick to save one cycle,
+                  //        since vmVars.addr will be assigned x before a
+                  //        step (++:), so if needed vmVars[x] is ready.
+                  //        Same is done for y and zoom.
+                  if (~opcode[5,1]) {
+                    if (~opcode[4,1]) {
+                      uint8 by(0);
+                      (mem,data,by) = nextByte(mem,data);
+                      x = {vmVars.addr[0,8],by};
+                    } else {
+                      x = vmVars.rdata;
+                    }
+                  } else {
+                    if (opcode[4,1]) {
+                      x = vmVars.addr + __signed(16h100);
+                    } else {
+                      x = vmVars.addr;
+                    }
+                  }
+
+                  int16 y(0);
+                  (mem,data,vmVars.addr) = nextByte(mem,data);
+                  if (~opcode[3,1]) {
+                    if (~opcode[2,1]) {
+                      uint8 by(0);
+                      (mem,data,by) = nextByte(mem,data);
+                      y = {vmVars.addr[0,8],by};
+                    } else {
+                      y = vmVars.rdata;
+                    }
+                  } else {
+                    y = vmVars.addr;
+                  }
+
+                  uint16 zoom(0);
+                  uint24 before_m        = mem.addr;
+                  (mem,data,vmVars.addr) = nextByte(mem,data); // zoom
+                  zoom = vmVars.addr;
+                  uint1 useSegVideo2 = 0;
+                  if (~opcode[1,1]) {
+                    if (~opcode[0,1]) {
+                      mem .addr = before_m;
+                      zoom = 16h40;
+                    } else {
+                      zoom = vmVars.rdata;
+                    }
+                  } else {
+                    if (opcode[0,1]) {
+                      useSegVideo2 = 1;
+                      mem.addr = before_m;
+                      zoom = 16h40;
+                    }
+                  }
+$$if SIMULATION then
+                  //__display("[%d] op_Polygon (vid_opcd_0x40) @%x",cycle,off);
+$$end
+                  () <- readPolygons <- (x,y,zoom,off,useSegVideo2);
+                  // continue
+                }
+                case 8h00: {
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var
+                  int16 value(0);
+                  (mem,data,value)       = nextWord(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_movConst [%d]=%d",cycle,vmVars.addr,value);
+$$end
+                  vmVars.wenable = 1;
+                  vmVars.wdata   = value;
+                }
+                case 8h01: {
+                  uint8 dst(0);
+                  (mem,data,dst)         = nextByte(mem,data); //read dst var
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read src var
+$$if SIMULATION then
+                  //__display("[%d] op_mov [%d] = [%d]",cycle,dst,vmVars.addr);
+$$end
+                  vmVars.wdata   = vmVars.rdata;
+                  vmVars.addr    = dst;
+                  vmVars.wenable = 1;
+                }
+                case 8h02: {
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var (dst)
+                  uint8 first        = vmVars.addr;
+                  int16 a            = vmVars.rdata;
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var (src)
+$$if SIMULATION then
+                    //__display("[%d] op_add [%d](%d) += [%d](%d)",cycle,first,a,vmVars.addr,vmVars.rdata);
+$$end
+                  vmVars.addr        = first;
+                  vmVars.wdata       = a + vmVars.rdata;
+                  vmVars.wenable     = 1;
+                }
+                case 8h03: {
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var
+                  int16 value(0);
+                  (mem,data,value)       = nextWord(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_addConst [%d]+=%d (before: %d)",cycle,vmVars.addr,value,vmVars.rdata);
+$$end
+                  vmVars.wdata      = vmVars.rdata + value; // add
+                  vmVars.wenable    = 1; // write result
+                }
+                case 8h04: {
+                  uint16 offset(0);
+                  (mem,data,offset) = nextWord(mem,data);
+                  scriptStackCalls.wenable = 1;
+                  scriptStackCalls.wdata   = mem.addr - segBytecode;
+                  mem.addr                 = offset + segBytecode;
+$$if SIMULATION then
+                  //__display("[%d] op_call(%x) (writes stack @%d)",cycle,offset,scriptStackCalls.addr);
+$$end
+++:
+                  scriptStackCalls.addr    = scriptStackCalls.addr + 1;
+                }
+                case 8h05: {
+                  scriptStackCalls.addr    = scriptStackCalls.addr - 1;
+$$if SIMULATION then
+                  //__display("[%d] op_ret (reads stack @%d)",cycle,scriptStackCalls.addr);
+$$end
+++:
+                  mem.addr      = scriptStackCalls.rdata + segBytecode;
+                }
+                case 8h06: {
+$$if SIMULATION then
+                  //__display("[%d] op_pauseThread",cycle);
+$$end
+                  gotoNextThread = 1;
+                }
+                case 8h07: {
+                  uint16 offset(0);
+                  (mem,data,offset) = nextWord(mem,data);
+                  mem.addr      = segBytecode + offset;
+$$if SIMULATION then
+                  //__display("[%d] op_jmp %x",cycle,offset);
+$$end
+                }
+                case 8h08: {
+                  uint8 tId(0);
+                  (mem,data,tId) = nextByte(mem,data);
+                  int16 pcOffsetRequested(0);
+                  (mem,data,pcOffsetRequested) = nextWord(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_setSetVec %d %x",cycle,tId,pcOffsetRequested);
+$$end
+                  threadsData.wenable = 1;
+                  threadsData.addr  = {1b$REQUESTED_PC_OFFSET$,tId[0,6]};
+                  threadsData.wdata = pcOffsetRequested;
+                }
+                case 8h09: {
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var
+                  vmVars.wdata   = vmVars.rdata - 1; // decrement var
+                  vmVars.wenable = 1;
+                  uint16 offset(0);
+                  (mem,data,offset) = nextWord(mem,data);
+                  // jump if zero
+$$if SIMULATION then
+                  //__display("[%d] op_jnz %x if %d != 0",cycle,offset,vmVars.rdata);
+$$end
+                  mem.addr = (vmVars.wdata != 0) ? (segBytecode + offset) : mem.addr;
+                }
+                case 8h0A: {
+                  uint8 cmp(0);
+                  (mem,data,cmp)         = nextByte(mem,data);
+                  (mem,data,vmVars.addr) = nextByte(mem,data);
+$$if SIMULATION then
+                  uint8 var = vmVars.addr;
+$$end
+                  int16 b = vmVars.rdata;
+                  int16 a(0);
+                  if (cmp[7,1]) {
+                    (mem,data,vmVars.addr) = nextByte(mem,data);
+                    a = vmVars.rdata;
+                  } else { if (cmp[6,1]) {
+                    (mem,data,a) = nextWord(mem,data);
+                  } else {
+                    (mem,data,a) = nextByte(mem,data);
+                  } }
+                  uint1 expr(0);
+                  switch (cmp[0,3]) {
+                    case 0: { expr = (b == a); }
+                    case 1: { expr = (b != a); }
+                    case 2: { expr = (b >  a); }
+                    case 3: { expr = (b >= a); }
+                    case 4: { expr = (b <  a); }
+                    case 5: { expr = (b <= a); }
+                    default: {
+$$if SIMULATION then
+                      __display("op_condJump, invalid cmp operator");
+                      __finish();
+$$end
+                    }
+                  }
+$$if SIMULATION then
+                  //__display("op_condJmp b[%d]:%d a:%d expr:%d [%d]",var,b,a,expr,cycle);
+$$end
+                  uint16 offset(0);
+                  (mem,data,offset) = nextWord(mem,data);
+                  mem.addr = expr ? (segBytecode + offset) : mem.addr;
+                }
+                case 8h0B: {
+                  int16 paletteId(0);
+                  paletteId = 0;
+                  (mem,data,paletteId)       = nextWord(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_setPalette %d",cycle,paletteId);
+$$end
+                  sameas(mem.addr) before = mem.addr;
+                  mem.addr       = segPalettes + (paletteId[8,8]<<5);
+                  mem.in_ready   = 1; // start reading (32 bytes, 16x 565 colors)
+                  uint6  n   = 0;
+                  uint16 clr(0);
+                  while (~n[5,1]) {
+                    clr              = {mem.data,clr[8,8]};
+                    palette.addr1    = {~pal_swap,4b000} | (n>>1);
+                    palette.wdata1   = clr;
+                    palette.wenable1 = mem.data_available;
+                    n                = mem.data_available ? (n + 1) : n;
+                  }
+                  next_palette     = ~pal_swap;
+                  palette.wenable1 = 0;
+                  mem.addr         = before;
+                  mem.in_ready     = 0;
+++: ++: // ensures memory is done
+                }
+                case 8h0C: {
+$$if SIMULATION then
+                  //__display("[%d] op_resetThread",cycle);
+$$end
+                  uint8 threadId(0); uint6 i(0); uint8 a(0);
+                  (mem,data,threadId) = nextByte(mem,data);
+                  (mem,data,i)        = nextByte(mem,data);
+                  (mem,data,a)        = nextByte(mem,data);
+                  int9 n = i - threadId;
+                  while (~n[8,1]) {
+                    threadsData.wenable       = (a == 2);
+                    threadsData.addr          = {1b$REQUESTED_PC_OFFSET$, threadId[0,6]};
+                    threadsData.wdata         = 16hfffe;
+                    vmIsChannelActive.wenable = (a < 2);
+                    vmIsChannelActive.addr    = {1b$REQUESTED_STATE$, threadId[0,6]};
+                    vmIsChannelActive.wdata   = a;
+                    threadId = threadId + 1;
+                    n        = n - 1;
+                  }
+                }
+                case 8h0D: {
+                  uint8 frameBufferId(0);
+                  (mem,data,frameBufferId) = nextByte(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_selectVideoPage %x",cycle,frameBufferId);
+$$end
+                  // wait for ops to terminate
+                  while (rasterizer_busy | blitter_busy) { }
+                  rasterizer_dst = frameBufferId == 255
+                                  ? (page_swap ? 2 : 1)
+                                  : frameBufferId;
+                }
+                case 8h0E: {
+                  uint8 pageId(0); uint8 color(0);
+                  (mem,data,pageId)  = nextByte(mem,data);
+                  (mem,data,color)   = nextByte(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_fillVideoPage %x,%x",cycle,pageId,color);
+$$end
+                  // wait for ops to terminate
+                  while (rasterizer_busy | blitter_busy) { }
+                  blitter_color  = color;
+                  blitter_src    = 3b100;
+                  blitter_dst    = pageId == 255 ? (page_swap ? 2 : 1)
+                                 : pageId == 254 ? (page_swap ? 1 : 2)
+                                 : pageId;
+                  blitter_start  = 1;
+                }
+                case 8h0F: {
+                  uint8 srcId(0);
+                  (mem,data,srcId) = nextByte(mem,data);
+                  uint8 dstId(0);
+                  (mem,data,dstId) = nextByte(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_copyVideoPage %x => %x",cycle,srcId,dstId);
+$$end
+                  // wait for ops to terminate
+                  while (rasterizer_busy | blitter_busy) { }
+                  blitter_src    = srcId == 255 ? (page_swap ? 2 : 1)
+                                  : srcId == 254 ? (page_swap ? 1 : 2)
+                                  : srcId;
+                  blitter_dst    = dstId == 255 ? (page_swap ? 2 : 1)
+                                  : dstId == 254 ? (page_swap ? 1 : 2)
+                                  : dstId;
+                  blitter_start  = 1;
+                }
+                case 8h10: {
+                  uint8 pageId(0);
+                  (mem,data,pageId) = nextByte(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_blitFramebuffer %x (swap:%b)",cycle,pageId,page_swap);
+$$end
+                  // read pause delay from vars
+                  vmVars.addr    = $VM_VARIABLE_PAUSE_SLICES$; // millsecond / 20
+++:
+$$if SIMULATION then
+                  uint24 pause   = 1;
+$$else
+                  // NOTE: adjust this below to change the overall game timing
+                  uint24 pause   = ((vmVars.rdata)<<18) + ((vmVars.rdata)<<17);
+$$end
+                  while (~pause[23,1]) {
+                    pause = pause - 1;
+                  }
+                  // this needs to be written it seems ...
+                  vmVars.wenable = 1;
+                  vmVars.addr    = 8hf7;
+                  vmVars.wdata   = 0;
+                  // wait for ops to terminate
+                  while (rasterizer_busy | blitter_busy) { }
+                  // wait for vblank
+                  while (~vblank)         { }
+                  // swap pages
+                  page_swap      = ~page_swap;
+                  pal_swap       = next_palette;
+                }
+                case 8h11: {
+                  mem.addr       = segBytecode + 16hffff;
+                  //               ^^^^^^ needed!
+                  gotoNextThread = 1;
+$$if SIMULATION then
+                    //__display("[%d] op_killThread",cycle);
+$$end
+                }
+                case 8h12: {
+                  uint16 stringId(0);
+                  uint16 x = 0;
+                  uint16 y = 0;
+                  uint16 color = 16hffff;
+                  (mem,data,stringId) = nextWord(mem,data);
+                  uint1 skip = 0;
+                  if (~opcode[0,1]) {
+                    // h12 = 00010010
+                    (mem,data,x)        = nextByte(mem,data);
+                    (mem,data,y)        = nextByte(mem,data);
+                    (mem,data,color)    = nextByte(mem,data);
+$$if SIMULATION then
+                    //__display("[%d] op_drawString %d %d %d %d",cycle,stringId,x,y,color);
+$$end
+                  } else {
+                    // h19 = 00011001
+                    skip     = ~stringId[15,1];
+                    stringId = {1b0,stringId[0,15]};
+$$if SIMULATION then
+                    // __display("[%d] op_updateMemList => op_drawString %d",cycle,stringId);
+$$end
+                  }
+                  // the pre-rendered strings are at offset 1MB
+                  // -> lookup start/stop
+                  sameas(mem.addr) before = mem.addr;
+                  mem.addr = (1<<20) | (stringId<<1);
+                  uint16 start(0);
+                  uint16 stop(0);
+                  (mem)        = readByte(mem);
+                  start[0,8]   = mem.data;
+                  (mem)        = readByte(mem);
+                  start[8,8]   = mem.data;
+                  (mem)        = readByte(mem);
+                  stop[0,8]    = mem.data;
+                  (mem)        = readByte(mem);
+                  stop[8,8]    = mem.data;
+$$if SIMULATION then
+                  // __display("[%d] text buffer %d [start %x stop %x] skip:%b",cycle,stringId,start,stop,skip);
+$$end
+                  // prepare for writing
+                  // -> wait raster/blitter
+                  while (rasterizer_busy | blitter_busy) { }
+                  // -> go!
+                  uint16 len   = (stop-start);
+                  int17  count = (len<<8) + (len<<6);
+$$if SIMULATION then
+                  // __display("[%d] text buffer start %x stop %x len %d",cycle,start,stop,len);
+                  // __display("[%d] text buffer from %x to %x, count %d",cycle,start*320,(start*320)+count,count);
+$$end
+                  pix_waddr     = (x<<3) + (y<<8) + (y<<6);
+                  mem.addr      = (1<<20) | ((start<<8) + (start<<6));
+                  mem.in_ready  = ~skip; // start reading
+                  while (~count[16,1] & ~skip) {
+                    pix_waddr   = mem.data_available ? pix_waddr+1 : pix_waddr;
+                    count       = mem.data_available ? count-1 : count;
+                    pix_wenable = mem.data_available & mem.data[4,1];
+                    pix_palid   = color & mem.data[0,4];
+$$if SIMULATION then
+                    //if (pix_wenable) {
+                    //  __write("%x ",mem.data[0,8]);
+                    //}
+$$end
+                  }
+                  pix_wenable  = 0;
+                  mem.in_ready = 0;
+                  // restore addr
+                  mem.addr     = before;
+++: ++: // ensures memory is done
+                }
+                case 8h13: {
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var (dst)
+                  uint8 first        = vmVars.addr;
+                  int16 a            = vmVars.rdata;
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var (src)
+$$if SIMULATION then
+                    //__display("[%d] op_sub [%d](%d) -= [%d](%d)",cycle,first,a,vmVars.addr,vmVars.rdata);
+$$end
+                  vmVars.addr        = first;
+                  vmVars.wdata       = a - vmVars.rdata;
+                  vmVars.wenable     = 1;
+                }
+                case 8h14: {
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var
+                  int16 value(0);
+                  (mem,data,value)       = nextWord(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_and [%d](%d) &= %d",cycle,vmVars.addr,vmVars.rdata,value);
+$$end
+                  vmVars.wdata       = vmVars.rdata & value;
+                  vmVars.wenable     = 1;
+                }
+                case 8h15: {
+$$if SIMULATION then
+                  //__display("[%d] op_or",cycle);
+$$end
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var
+                  int16 value(0);
+                  (mem,data,value)       = nextWord(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_or [%d](%d) |= %d",cycle,vmVars.addr,vmVars.rdata,value);
+$$end
+                  vmVars.wdata       = vmVars.rdata | value;
+                  vmVars.wenable     = 1;
+                }
+                case 8h16: {
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var
+                  int16 value(0);
+                  (mem,data,value)       = nextWord(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_shl [%d](%d) <<= %d",cycle,vmVars.addr,vmVars.rdata,value);
+$$end
+                  // vmVars.wdata       = vmVars.rdata << value;
+                  // TODO FIXME is this below really using less LUTs?
+                  vmVars.wdata       = vmVars.rdata;
+                  while (value != 0) {
+                    vmVars.wdata = vmVars.wdata << 1;
+                    value        = value - 1;
+                  }
+                  vmVars.wenable     = 1;
+                }
+                case 8h17: {
+                  (mem,data,vmVars.addr) = nextByte(mem,data); //read var
+                  int16 value(0);
+                  (mem,data,value)       = nextWord(mem,data);
+$$if SIMULATION then
+                  //__display("[%d] op_shr [%d](%d) >>= %d",cycle,vmVars.addr,vmVars.rdata,value);
+$$end
+                  // vmVars.wdata       = vmVars.rdata >> value;
+                  vmVars.wdata       = vmVars.rdata;
+                  while (value != 0) {
+                    vmVars.wdata = vmVars.wdata >> 1;
+                    value        = value - 1;
+                  }
+                  vmVars.wenable     = 1;
+                }
+                case 8h18: {
+                  //uint16 resourceId(0);
+                  //uint8  freq(0);
+                  //uint8  vol(0);
+                  //uint8  channel(0);
+                  //(mem,data,resourceId) = nextWord(mem,data);
+                  //(mem,data,freq)       = nextByte(mem,data);
+                  //(mem,data,vol)        = nextByte(mem,data);
+                  //(mem,data,channel)    = nextByte(mem,data);
+                  mem.addr = mem.addr + 5;
+$$if SIMULATION then
+                  //__display("[%d] op_playSound %d %d %d %d",cycle,resourceId,freq,vol,channel);
+                  //__display("[%d] op_playSound",cycle);
+$$end
+                }
+                // case 8h19: { } // no longer used, maps to op_drawString instead
+                case 8h1A: {
+                  //uint16 resNum(0);
+                  //uint16 delay(0);
+                  //uint8  pos(0);
+                  //(mem,data,resNum) = nextWord(mem,data);
+                  //(mem,data,delay)  = nextWord(mem,data);
+                  //(mem,data,pos)    = nextByte(mem,data);
+                  mem.addr = mem.addr + 5;
+$$if SIMULATION then
+                  //__display("[%d] op_playMusic %d %d %d",cycle,resNum,delay,pos);
+                  //__display("[%d] op_playMusic",cycle);
+$$end
+                }
+                default: {
+$$if SIMULATION then
+                  __display("internal error (opcode:%x)",opcode);
+                  __finish();
+$$end
+                }
+              }
+            }
+
+          }
+$$if SIMULATION then
+          //__display("[thread %d] done",threadId);
+$$end
+          // save pc
+          threadsData.wenable = 1;
+          threadsData.addr    = {1b$PC_OFFSET$,  threadId[0,6]};
+          threadsData.wdata   = mem.addr - segBytecode;
+        }
+        threadId = threadId + 1;
+      }
+    }
+
+  } // forever
+
+$$if ENABLE_GAMESTATE_EXPERIMENT then
+  // write sentinel in BRAM so resume is detected
+  vmVars.addr    = $VM_VARIABLE_HERO_POS_MASK$;
+  vmVars.wenable = 1;
+  vmVars.wdata   = 16hA5A5;
+$$end
+  }
+
+  always_after {
+$$if SIMULATION then
+    cycle = cycle + 1;
+$$else
+    mem.addr[21,1] = 1; // relocate to 2MB offset on actual hardware
+$$end
+  }
+
+}
