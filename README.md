@@ -361,7 +361,7 @@ This repository does not contain any game data, and of course the game data is n
 
 ```BANK01, BANK02, BANK03, BANK04, BANK05, BANK06, BANK07, BANK08, BANK09, BANK0A, BANK0B, BANK0C, BANK0D, MEMLIST.BIN```
 
-These are easily copied from an *official* version of the game. I use the files from the *Out of this world* DOS version. Simply copy these files to the `GAMEDATA` folder before anything else.
+These are easily copied from an *official* version of the game. I use the files from the *Another World* DOS version (dated 19/3/92 in the README). Simply copy these files to the `GAMEDATA` folder before anything else.
 
 > You might run into issues using different game versions, please let me know.
 
