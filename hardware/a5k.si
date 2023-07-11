@@ -711,9 +711,9 @@ $$end
 
     // leds = {vm.pal_swap,rast.pix_wenable,blit.dst_wenable,vm.pix_wenable,vm.page_swap};
     // leds = jstick;
-    // leds = vm.leds;
+    leds = vm.leds;
     // leds = {1b0,rom.in_ready,rom.busy};
-    leds = 0;
+    // leds = 0;
 
 $$if SIMULATION then
     if (rast.busy & blit.busy) {
