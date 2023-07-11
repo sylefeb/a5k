@@ -9,8 +9,7 @@
 >
 > **Hardware:** Current supported boards are the icebreaker + VGA PMOD, mch2022 badge and ULX3S over HDMI. Pre-built bitstreams are included but the [game data](#wheres-all-the-data) is needed in `GAMEDATA` so the data packs can be prepared. [Jump here](#wheres-all-the-data) if you'd like to test on hardware first.
 
-<center><img width=256 src='docs/teaser1.jpg'/>&nbsp;&nbsp;
-<img width=256 src='docs/teaser2.jpg'/></center>
+<p align="center"><img width=256 src='docs/teaser1.jpg'/>&nbsp;&nbsp;<img width=256 src='docs/teaser2.jpg'/></p>
 
 ## Foreword
 
@@ -152,7 +151,7 @@ The framebuffers are using the four SPRAM blocks of the UP5K. A SPRAM is similar
 
 Each SPRAM block is 32KB, with a 16 bits data interface and a write mask allowing to write nibbles (4 bits) independently. This is perfect for us as Another World uses a 16 colors palette (4 bits per pixel) in 320x200 resolution buffers. This makes each framebuffer 32KB, so one framebuffer maps perfectly onto a SPRAM block.
 
-The [`videopage` unit](hardware/a5k.si#L169) in `a5k.si` implements a framebuffer in a SPRAM block, and four `videopage` units are instanced ([`page0` to `page3`](hardware/a5k.si#L623)) in the SOC `main` unit, one per framebuffer.
+The [`videopage` unit](hardware/a5k.si#L169) in `a5k.si` implements a framebuffer in a SPRAM block, and four `videopage` units are instanced ([`page0` to `page3`](hardware/a5k.si#L626)) in the SOC `main` unit, one per framebuffer.
 
 The `videopage` unit exposes a 4 bits interface with per-pixel addressing, and translates these addresses into 16 bits wide access in SPRAM with a write mask and adequate shifts.
 
@@ -172,10 +171,10 @@ The display controller thus has to be consistently fed with pixels outside
 of the blank interval, *and this process cannot be paused within a frame*. Two framebuffers are special: `page1` and `page2`. They are the one being sent to the display. Why two? Overall one is being sent while the game draws in the other, and the buffers are swapped when ready. This prevents visible blinking while new shapes are drawn, an approach known as *double buffering*.
 
 However, the game sometimes reads from the buffer being displayed. The `videopage` (and underlying SPRAM) cannot support this: at a given cycle a single read or write is possible. To deal with this situation we have to restrict access to the displayed page, allowing other reads to occur only during the blanking interval, when the screen is not being refreshed. This is detected by setting the variable
-[`display_conflict`](hardware/a5k.si#L714) that is used to disable the blitter and rasterizer
+[`display_conflict`](hardware/a5k.si#L709) that is used to disable the blitter and rasterizer
 when they should not access a videopage.
 
-The display section accessing the pages can be seen in [a5k.si](hardware/a5k.si#L757) (for VGA/HDMI).
+The display section accessing the pages can be seen in [a5k.si](hardware/a5k.si#L771) (for VGA/HDMI).
 
 > Some special BRAMs, called *dual-port*, support two accesses within the same cycle. Our SPRAMs are hower *single port* and perform a single access within a cycle. This is actually the meaning of SP- in SPRAM!
 
@@ -209,7 +208,7 @@ when `busy` is low no writes can occur, so even though `count` keeps going nothi
 > always doing it.
 
 I mentioned earlier that `count` is only increasing when `enabled` is high.
-Looking into `main` we see that `enabled` is bound to `vblank` ([see the line](hardware/a5k.si#L634)
+Looking into `main` we see that `enabled` is bound to `vblank` ([see the line](hardware/a5k.si#L633)
 `blitter blit( enabled  <: video.vblank );` ). This
 ensures that the blitter only copies during `vblank`, such that the screen
 controller has access priority. The blitter pauses during display.
@@ -247,7 +246,7 @@ I don't like to see *hierarchy* in this name. This smells like recursion... and 
 
 > Why is there a recursion here? Many polygon-based graphics engine have a notion of groups so that they can animate entire shapes at once. To create hierarchical animations -- think of a shoulder-elbow-wrist hierarchy -- a group contains polygons but also other sub-groups, each with a local transform. This is exactly what happens here.
 
-How do we deal with recursion? We implement a stack! Another BRAM to the rescue and *voilà*. The process is in the subroutine [`readPolygons`](hardware/vm.si#L212) in `vm.si`. A BRAM stack called [`polygonStack`](hardware/vm.si#L184) is used to keep track of the recursion status. Each time a polygon (leaf) is found it is sent to the rasterizer as soon as it is free (a [loop](hardware/vm.si#L259) waits on `rasterizer_busy` in case a previous polygon is still being drawn). Each time a recursive call occurs (node) the calls are pushed on the stack. This proceeds until the stack is emptied.
+How do we deal with recursion? We implement a stack! Another BRAM to the rescue and *voilà*. The process is in the subroutine [`readPolygons`](hardware/vm.si#L214) in `vm.si`. A BRAM stack called [`polygonStack`](hardware/vm.si#L184) is used to keep track of the recursion status. Each time a polygon (leaf) is found it is sent to the rasterizer as soon as it is free (a [loop](hardware/vm.si#L261) waits on `rasterizer_busy` in case a previous polygon is still being drawn). Each time a recursive call occurs (node) the calls are pushed on the stack. This proceeds until the stack is emptied.
 
 A tricky question is the stack size. I did set it up manually at 128 polygons. At this point we are using quite a lot of BRAM and there is not much left.
 
@@ -259,7 +258,7 @@ But the rasterizer is empty ...
 
 ## Drawing polygons!
 
-Finally we get to the rasterizer. The [`rasterizer` unit](hardware/a5k.si#L221) is described in `a5k.si` and [is instanced](hardware/a5k.si#L590) in the `main` unit.
+Finally we get to the rasterizer. The [`rasterizer` unit](hardware/a5k.si#L220) is described in `a5k.si` and [is instanced](hardware/a5k.si#L595) in the `main` unit.
 
 We are given a list of vertices in the `polygon` BRAM and have to draw the corresponding polygon in the framebuffer selected by `rasterizer_dst`.
 
@@ -289,7 +288,7 @@ This is why the rasterizer can be kept quite simple. Still, it has to deal with 
 
 Yeah well of course there are *details*. The engine uses a nice palette trick to give the illusion of transparency (glass, cast light). Some polygons being drawn will only write the top bit in the framebuffer, switching the color already there to a higher part of the palette, giving the illusion of a transparent overlay.
 
-This introduces some complexity in the rasterizer. To flip only one bit *we need to know the prior value of the pixel at this location*. This is why [the rasterizer inner loop](hardware/a5k.si#L375) -- drawing a span -- proceeds in multiple cycles: read the previous value of the pixel, modify it (or override it), and write it back.
+This introduces some complexity in the rasterizer. To flip only one bit *we need to know the prior value of the pixel at this location*. This is why [the rasterizer inner loop](hardware/a5k.si#L374) -- drawing a span -- proceeds in multiple cycles: read the previous value of the pixel, modify it (or override it), and write it back.
 
 > This is done in a slightly different order in the loop, for compactness and due to latencies of registers in the path between the rasterizer and framebuffer.
 
@@ -312,12 +311,12 @@ Because yes, the game has a VM, a blitter, a rasterizer, **and a font drawing en
 
 But wait, there's yet another issue, which albeit seemingly unrelated can be solved elegantly with the same approach. In one particular part (part 6) the backgrounds are not drawn from polygons. Instead they are pre-rendered and loaded from data.
 
-Well, at this stage I had only a small LUT budget left on the FPGA. One thing I *do* have plenty of, however, is ROM. The SPI-flash is generously large on most FPGA boards. So I though, what can you do with few LUTs and a lot of memory? Brute force of course! I went on to pre-render all fonts into pixel buffers stored in ROM. I then highjacked [the `op_drawString` opcode](hardware/vm.si#L900) to lookup a pre-rendered buffer address in a ROM table from the string id. The VM then copies over the data into the target framebuffer. That did the trick! And the same mechanism can be reused for pre-rendered framebuffers in part 6.
+Well, at this stage I had only a small LUT budget left on the FPGA. One thing I *do* have plenty of, however, is ROM. The SPI-flash is generously large on most FPGA boards. So I though, what can you do with few LUTs and a lot of memory? Brute force of course! I went on to pre-render all fonts into pixel buffers stored in ROM. I then highjacked [the `op_drawString` opcode](hardware/vm.si#L860) to lookup a pre-rendered buffer address in a ROM table from the string id. The VM then copies over the data into the target framebuffer. That did the trick! And the same mechanism can be reused for pre-rendered framebuffers in part 6.
 
-<center>
+<p align="center">
 <img width=256 src='docs/prerendered1.jpg'/>
 <img width=256 src='docs/prerendered2.jpg'/>
-</center>
+</p>
 <p align='center'><i><b>Left:</b> Part 6 uses a pre-rendered buffer. Without it we get random garbage when the level starts! <b>Right:</b> After implementing loading pre-rendered buffers.</i></p>
 
 > Using the same mechanism for both was luck, as I first implemented the `op_drawString` hack, before realizing the need to copy entire buffers from data to a framebuffer. Hey, sometimes there are good surprises!
