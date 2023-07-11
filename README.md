@@ -52,7 +52,7 @@ the code - has to fit within a budget. This budget is often expressed in number
 of 'LUT's which are the small programmable units of the FPGA fabric (LUT stands
 for Lookup Up Table, this is a [simple yet powerful concept](https://github.com/sylefeb/Silixel) behind FPGAs).
 
-To give you an idea, 1K LUTs let's you do a fairly capable [dual core RISC-V 32 bits CPU]([https://](https://github.com/sylefeb/Silice/blob/master/projects/ice-v/IceVDual.md)) and 5K LUTs (plus some DSPs) a [SOC that can run Doom](https://www.youtube.com/watch?v=3ZBAZ5QoCAk) and a [CPU+GPU capable of perspective correct 3D rendering](https://github.com/sylefeb/tinygpus/) (Comanche, Doom, Quake). Thus it seemed 5K LUTs ought to be enough for Another World.
+To give you an idea, 1K LUTs lets you do a fairly capable [dual core RISC-V 32 bits CPU]([https://](https://github.com/sylefeb/Silice/blob/master/projects/ice-v/IceVDual.md)) and 5K LUTs (plus some DSPs) a [SOC that can run Doom](https://www.youtube.com/watch?v=3ZBAZ5QoCAk) and a [CPU+GPU capable of perspective correct 3D rendering](https://github.com/sylefeb/tinygpus/) (Comanche, Doom, Quake). Thus it seemed 5K LUTs ought to be enough for Another World.
 
 > Overall it really feels the design wanted to fit 5K LUTs, this is more or less where it ended without too much optimization effort. But it could, for sure, be a lot smaller.
 
