@@ -35,8 +35,8 @@ else
 ifeq ($(BOARD),mch2022)
 	./build/fpga.py build/write.bin
 	sleep 0.5
-	python ./build/send.py $(SERIAL_PORT) 2097152 ROMs/$*.raw
-	./hardware/build/fpga.py BITSTREAMs/$(BOARD)/$*.bit
+	python3 ./build/send.py $(SERIAL_PORT) 2097152 ROMs/$*.raw
+	./build/fpga.py BITSTREAMs/$(BOARD)/$*.bit
 else
 ifeq ($(BOARD),ulx3s)
 	openFPGALoader -b ulx3s -f -o 2097152 ROMs/$*.raw
@@ -52,9 +52,20 @@ simul%: ROMs/%.raw
 	cp ROMs/$*.si hardware/data.si
 	make -C hardware verilator
 
-mch2022prog:
-	mkdir -p build
-	-wget -nc https://raw.githubusercontent.com/badgeteam/mch2022-tools/master/fpga.py -O build/fpga.py
-	chmod 755 build/fpga.py
-	-wget -nc https://github.com/sylefeb/mch2022-silice/raw/main/qpsram_loader/bitstreams/write.bin -O build/write.bin
-	-wget -nc https://github.com/sylefeb/mch2022-silice/raw/main/qpsram_loader/send.py -O build/send.py
+build:
+	mkdir -p $@
+
+build/fpga.py: build
+	-wget https://raw.githubusercontent.com/badgeteam/mch2022-tools/master/fpga.py -O $@
+	chmod 755 $@
+
+build/write.bin: build
+	-wget https://github.com/sylefeb/mch2022-silice/raw/main/qpsram_loader/bitstreams/write.bin -O $@
+
+build/send.py: build
+	-wget https://github.com/sylefeb/mch2022-silice/raw/main/qpsram_loader/send.py -O $@
+	chmod 755 $@
+
+mch2022prog: build/fpga.py build/write.bin build/send.py
+
+.PHONY: mch2022prog
