@@ -422,9 +422,9 @@ for a beautiful rendition of the intro. Replacing `play1` by `playN` with `N`
 the game part you'd like to play, using the mch2022 stick and button.
 
 If necessary, adjust the serial port for sending data adjust `SERIAL_PORT`.
-Under Linux this will typically be `/dev/ttyUSB1`:
+Under Linux this will typically be `/dev/ttyACM1` or `/dev/ttyUSB1`:
 
-```make play1 BOARD=mch2022 SERIAL_PORT=/dev/ttyUSB1```
+```make play1 BOARD=mch2022 SERIAL_PORT=/dev/ttyACM1```
 
 Under Windows it will be one of the COM ports. In any case, keep in mind the
 badge exposes two ports: one for programming and one for UART. The second one
