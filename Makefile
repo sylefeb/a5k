@@ -12,13 +12,13 @@ BUILD/raw:
 	mkdir -p ROMs
 
 ROMs/%.raw: BUILD/raw
-	cd BUILD; ./raw --extract=$* --datapath=../GAMEDATA
+	cd BUILD; ./raw --extract=$* --datapath=../GAMEDATA --data-offsets
 	cp BUILD/data.raw ROMs/$*.raw
-	cp BUILD/data.si  ROMs/$*.si
+	# cp BUILD/data.si  ROMs/$*.si
 
 BITSTREAMs/$(BOARD)/%.bit: # ROMs/%.raw hardware/a5k.si hardware/vm.si
 	cp ROMs/$*.raw hardware/data.raw
-	cp ROMs/$*.si  hardware/data.si
+	# cp ROMs/$*.si  hardware/data.si
 	make -C hardware $(BOARD) ARGS="--no_program"
 	mkdir -p BITSTREAMs
 	mkdir -p BITSTREAMs/$(BOARD)/
@@ -49,7 +49,7 @@ endif
 
 simul%: ROMs/%.raw
 	cp ROMs/$*.raw hardware/data.raw
-	cp ROMs/$*.si hardware/data.si
+	# cp ROMs/$*.si hardware/data.si
 	make -C hardware verilator
 
 build:
