@@ -547,7 +547,7 @@ $$elseif MCH2022 then
   );
   // buttons
   spi_buttons btns(
-    clk      <: clock1x,    resetq   <: reset,
+    clk      <: clock1x,      resetq   <: reset,
     spi_mosi <: espspi_mosi,  spi_miso :> espspi_miso,
     spi_clk  <: espspi_clk,   spi_cs_n <: espspi_cs_n,
     irq_n    :> espirq_n,
@@ -641,6 +641,8 @@ $$end
 $$if BUTTONS then
     vm_reset ::= btns[1,1];
     //          ^^ assigns with a register in the path (registers button)
+$$elseif MCH2022 and not ENABLE_GAMESTATE_EXPERIMENT then
+    vm_reset = btns.back;
 $$end
 
 $$if VGA then

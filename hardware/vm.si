@@ -100,7 +100,7 @@ unit vm(
   // joystick
   input uint6   jstick,
   // leds
-  output uint8  leds,
+  output uint8  leds(0),
 $$if UART then
   // uart (DEBUG)
   input   uint1 uart_rx,
@@ -352,9 +352,7 @@ $$if UART then
     uo.data_in_ready := 0;
 $$end
 
-    leds = 0;
     while (mem.busy) {} // will require pressing reset if commented
-    leds = 1;
 
 $$if SIMULATION then
     __display("Hello Another World");
@@ -371,7 +369,6 @@ $$end
     threadsData.addr    = {1b$PC_OFFSET$,6b0};
     threadsData.wdata   = 0;
 
-    leds = 2;
     // loop into code execution
 $$if ENABLE_GAMESTATE_EXPERIMENT then
     while (~jstick[5,1]) { // stop if B pressed
@@ -440,8 +437,6 @@ $$end
     vmVars.wenable = 1;
     vmVars.wdata   = m;
 
-    leds = 3;
-
     // hostFrame
     {
       uint7 threadId = 0;
@@ -485,7 +480,9 @@ $$end
 ++:
               uint8 opcode(0); // read opcode
               (mem,data,opcode) = nextByte(mem,data);
-              leds = opcode;   // light show
+$$if not MCH2022 then
+              leds = opcode; // light show (not on mch2022, led is too bright)
+$$end
 $$if SIMULATION then
               // sanity check in simulation
               if (opcode > 8h1a && ~opcode[7,1] && ~opcode[6,1]) {
