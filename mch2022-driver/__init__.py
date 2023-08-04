@@ -16,19 +16,39 @@ def op_split(path):
 def getcwd():
 	return op_split(__file__)[0]
 
+def level_button(level, selected):
+	# white if selected, green otherwise
+	color = 0xFFFFFF if selected else 0x00FF00
+	y = (level - 1) * 30
+	display.drawRect(0, y, 80, 24, True, 0x0000FF)
+	text = "level " + str(level) if level < 8 else "Quit"
+	display.drawText(5, y, text, color, "dejavusans20")
+
+
+def level_buttons():
+	global g_level
+
+	display.drawFill(0x000000)
+	for lvl in range(1, 9):
+		level_button(lvl, lvl == g_level)
+	display.flush()
+
 # buttons
 g_btn_state = 0
 g_level = 1
+g_playing = False
 
 def button_report(btn_mask, pressed):
 	global g_btn_state
+	global g_playing
 
-	if pressed:
-		g_btn_state |= btn_mask
-	else:
-		g_btn_state &= ~btn_mask
-	button_report = bytearray([ 0xf4, g_btn_state >> 8, g_btn_state & 0xff, btn_mask >> 8, btn_mask & 0xff ])
-	mch22.fpga_send(bytes(button_report))
+	if g_playing:
+		if pressed:
+			g_btn_state |= btn_mask
+		else:
+			g_btn_state &= ~btn_mask
+		button_report = bytearray([ 0xf4, g_btn_state >> 8, g_btn_state & 0xff, btn_mask >> 8, btn_mask & 0xff ])
+		mch22.fpga_send(bytes(button_report))
 
 def on_action_btn_a(pressed):
 	button_report(1 << 9, pressed)
@@ -38,25 +58,25 @@ def on_action_btn_b(pressed):
 
 def on_action_btn_home(pressed):
 	button_report(1 << 5, pressed)
-	mch22.fpga_disable()
-	mch22.lcd_mode(0)
-	mch22.exit_python()
 
 def on_action_btn_menu(pressed):
 	global g_level
+	global g_playing
 
 	button_report(1 << 6, pressed)
-	if g_level < 7 and pressed:
-		g_level += 1
-		run()
-
+	if pressed:
+		if g_playing:
+			mch22.fpga_disable()
+			mch22.lcd_mode(0)
+			level_buttons()
+			g_playing = False
+		# switching back to AW not easy to implement
+		#else:
+		#	mch22.lcd_mode(1)
+		#	g_playing = True
+		
 def on_action_btn_select(pressed):
-	global g_level
-
 	button_report(1 << 7, pressed)
-	if g_level > 1 and pressed:
-		g_level -= 1
-		run()
 
 def on_action_btn_start(pressed):
 	button_report(1 << 8, pressed)
@@ -68,18 +88,51 @@ def on_action_btn_right(pressed):
 	button_report(1 << 3, pressed)
 
 def on_action_btn_up(pressed):
+	global g_level
+	global g_playing
+
 	button_report(1 << 1, pressed)
+	if not g_playing and g_level > 1 and pressed:
+		level_button(g_level, False)
+		g_level -= 1
+		level_button(g_level, True)
+		display.flush()
+
 
 def on_action_btn_down(pressed):
+	global g_level
+	global g_playing
+
 	button_report(1 << 0, pressed)
+	if not g_playing and g_level < 8 and pressed:
+		level_button(g_level, False)
+		g_level += 1
+		level_button(g_level, True)
+		display.flush()
 
 def on_action_btn_press(pressed):
-	button_report(1 << 4, pressed)
-
-def run():
 	global g_level
+	global g_playing
 
-	str_level = str(g_level)
+	button_report(1 << 4, pressed)
+	if not g_playing:
+		if g_level == 8:
+			mch22.fpga_disable()
+			mch22.lcd_mode(0)
+			mch22.exit_python()
+		else:
+			str_level = str(g_level)
+			display.drawFill(0x000000)
+			display.drawText(10, 10, "Loading", 0xFFFFFF, "dejavusans20")
+			display.drawText(10, 30, "Another world level " + str_level, 0xFFFFFF, "dejavusans20")
+			display.flush()
+			with open(getcwd() + "/write_spi.bin", "rb") as f:
+				mch22.fpga_load(f.read())
+			load(str_level)
+			start(str_level)
+			g_playing = True
+
+def setup():
 	buttons.attach(buttons.BTN_A, on_action_btn_a)
 	buttons.attach(buttons.BTN_B, on_action_btn_b)
 	buttons.attach(buttons.BTN_HOME, on_action_btn_home)
@@ -91,17 +144,7 @@ def run():
 	buttons.attach(buttons.BTN_UP, on_action_btn_up)
 	buttons.attach(buttons.BTN_DOWN, on_action_btn_down)
 	buttons.attach(buttons.BTN_PRESS, on_action_btn_press)
-
-	mch22.fpga_disable()
-	mch22.lcd_mode(0)
-	display.drawFill(0x000000)
-	display.drawText(10, 10, "Loading", 0xFFFFFF, "dejavusans20")
-	display.drawText(10, 30, "Another world level " + str_level, 0xFFFFFF, "dejavusans20")
-	display.flush()
-	with open(getcwd() + "/write_spi.bin", "rb") as f:
-		mch22.fpga_load(f.read())
-	load(str_level)
-	start(str_level)
+	level_buttons()
 
 def load(level):
 	spi_cmd_nop2 = bytearray(2)
@@ -135,4 +178,4 @@ def start(level):
 		mch22.lcd_mode(1)
 		mch22.fpga_load(f.read())
 
-run()
+setup()
