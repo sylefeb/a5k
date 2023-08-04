@@ -38,6 +38,9 @@ def on_action_btn_b(pressed):
 
 def on_action_btn_home(pressed):
 	button_report(1 << 5, pressed)
+	mch22.fpga_disable()
+	mch22.lcd_mode(0)
+	mch22.exit_python()
 
 def on_action_btn_menu(pressed):
 	global g_level
