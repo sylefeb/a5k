@@ -163,14 +163,12 @@ def load(level):
 			mch22.fpga_send(bytes(spi_cmd_fread_get))
 			mch22.fpga_transaction(bytes(spi_cmd_resp_ack))
 			#print(".", end="")
-			spi_cmd_fread_put = bytearray(0x401)
-			spi_cmd_fread_put[0] = 0xf9
 			data = f.read(1024)
 			data_len = len(data)
 			if data_len < 1024:
 				spi_cmd_fread_put = bytearray(0x401)
 				spi_cmd_fread_put[0] = 0xf9
-			spi_cmd_fread_put[1:data_len] = data
+			spi_cmd_fread_put[1:data_len + 1] = data
 			mch22.fpga_send(bytes(spi_cmd_fread_put))
 
 def start(level):
