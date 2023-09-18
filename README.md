@@ -2,7 +2,7 @@
 
 > Just want to test?
 >
-> **Simulation:** Checkout the repo, install [Silice](https://github.com/sylefeb/Silice/GetStarted.md)
+> **Simulation:** Checkout the repo, install [Silice](https://github.com/sylefeb/Silice/blob/master/GetStarted.md)
 > put the [game data](#wheres-all-the-data) in `GAMEDATA`
 > and from a command line type in `make simul1` (no need for an actual FPGA,
 > this will run the intro in simulation).
