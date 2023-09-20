@@ -8,6 +8,9 @@
 > this will run the intro in simulation).
 >
 > **Hardware:** Current supported boards are the icebreaker + VGA PMOD, mch2022 badge and ULX3S over HDMI. Pre-built bitstreams are included but the [game data](#wheres-all-the-data) is needed in `GAMEDATA` so the data packs can be prepared. [Jump here](#wheres-all-the-data) if you'd like to test on hardware first.
+>
+> **Extras:** On the mch2022 badge you can now select which game part to play from a menu! [See here](extras/mch2022/README.md) for more details.
+>
 
 <p align="center"><img width=256 src='docs/teaser1.jpg'/>&nbsp;&nbsp;<img width=256 src='docs/teaser2.jpg'/></p>
 

@@ -12,35 +12,32 @@ BUILD/raw:
 	mkdir -p ROMs
 
 ROMs/%.raw: BUILD/raw
-	cd BUILD; ./raw --extract=$* --datapath=../GAMEDATA
+	cd BUILD; ./raw --extract=$* --datapath=../GAMEDATA --data-offsets
 	cp BUILD/data.raw ROMs/$*.raw
-	cp BUILD/data.si  ROMs/$*.si
 
-BITSTREAMs/$(BOARD)/%.bit: # ROMs/%.raw hardware/a5k.si hardware/vm.si
-	cp ROMs/$*.raw hardware/data.raw
-	cp ROMs/$*.si  hardware/data.si
+BITSTREAMs/$(BOARD)/bitstream.bit:
 	make -C hardware $(BOARD) ARGS="--no_program"
 	mkdir -p BITSTREAMs
 	mkdir -p BITSTREAMs/$(BOARD)/
-	cp hardware/BUILD_$(BOARD)/build.bi? BITSTREAMs/$(BOARD)/$*.bit
+	cp hardware/BUILD_$(BOARD)/build.bi? BITSTREAMs/$(BOARD)/bitstream.bit
 
-part%: ROMs/%.raw BITSTREAMs/$(BOARD)/%.bit
+part%: ROMs/%.raw BITSTREAMs/$(BOARD)/bitstream.bit
 	@echo "-> build done for part $*."
 
-play%: ROMs/%.raw BITSTREAMs/$(BOARD)/%.bit mch2022prog
+play%: ROMs/%.raw BITSTREAMs/$(BOARD)/bitstream.bit mch2022prog
 ifeq ($(BOARD),icebreaker)
 	iceprog -o 2M ROMs/$*.raw
-	iceprog BITSTREAMs/$(BOARD)/$*.bit
+	iceprog BITSTREAMs/$(BOARD)/bitstream.bit
 else
 ifeq ($(BOARD),mch2022)
 	./build/fpga.py build/write.bin
 	sleep 0.5
 	python3 ./build/send.py $(SERIAL_PORT) 2097152 ROMs/$*.raw
-	./build/fpga.py BITSTREAMs/$(BOARD)/$*.bit
+	./build/fpga.py BITSTREAMs/$(BOARD)/bitstream.bit
 else
 ifeq ($(BOARD),ulx3s)
 	openFPGALoader -b ulx3s -f -o 2097152 ROMs/$*.raw
-	openFPGALoader -b ulx3s BITSTREAMs/$(BOARD)/$*.bit
+	openFPGALoader -b ulx3s BITSTREAMs/$(BOARD)/bitstream.bit
 else
 	echo "supports only icebreaker and mch2022 for now"
 endif
@@ -49,7 +46,6 @@ endif
 
 simul%: ROMs/%.raw
 	cp ROMs/$*.raw hardware/data.raw
-	cp ROMs/$*.si hardware/data.si
 	make -C hardware verilator
 
 build:

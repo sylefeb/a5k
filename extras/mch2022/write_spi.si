@@ -1,0 +1,154 @@
+// @sylefeb 2020
+// https://github.com/sylefeb/Silice
+// MIT license, see LICENSE_MIT in Silice repo root
+//
+// Thanks to @hfmanson for this modified version loading from a file over SPI
+
+$include('../../hardware/common/qpsram2x.si')
+
+$$if ICE40 then
+import('../../hardware/common/ext/plls/icebrkr_50.v')
+$$end
+
+// ESP32 SPI file interface
+import('../../hardware/common/spi_file.v')
+append('../../hardware/common/ext/spi_dev_core.v')
+append('../../hardware/common/ext/spi_dev_proto.v')
+append('../../hardware/common/ext/spi_dev_fread.v')
+append('../../hardware/common/ext/ram_sdp.v')
+
+$$uart_bauds = 500000
+$$uart_in_clock_freq_mhz = 50
+$include('../../hardware/common/ext/uart.si')
+
+unit main(
+  output uint3 leds,
+  input  uint1 uart_rx,
+  output uint1 uart_tx,
+  inout  uint1 ram_io0,
+  inout  uint1 ram_io1,
+  inout  uint1 ram_io2,
+  inout  uint1 ram_io3,
+  output uint1 ram_clk,
+  output uint1 ram_csn,
+  input  uint1 espspi_mosi,
+  output uint1 espspi_miso,
+  input  uint1 espspi_clk,
+  input  uint1 espspi_cs_n,
+  output uint1 espirq_n,
+)
+// clocking (pll) and reset
+$$if ICE40 then
+<@clock_pll> {
+  uint1 clock_pll = uninitialized;
+  pll pllgen(
+    clock_in  <: clock,
+    clock_out :> clock_pll,
+  );
+$$else
+{
+$$end
+
+  // QPSRAM RAM
+  qpsram_ram ram(
+    ram_csn  :> ram_csn,
+    ram_clk  :> ram_clk,
+    ram_io0 <:> ram_io0,
+    ram_io1 <:> ram_io1,
+    ram_io2 <:> ram_io2,
+    ram_io3 <:> ram_io3,
+  );
+
+  // ESP32 SPI file interface
+  spi_file sf(
+    clk      <: clock_pll,
+    resetq   <: reset,
+    spi_mosi <: espspi_mosi,
+    spi_miso :> espspi_miso,
+    spi_clk  <: espspi_clk,
+    spi_cs_n <: espspi_cs_n,
+    irq_n    :> espirq_n,
+  );
+
+  // vars
+  uint11 file_recv_count(0);
+  bram   uint8 buffer[1024] = uninitialized;
+  uint14 iter(0);
+  uint11 n(0);
+
+  uint1  writing(0);
+  // offset to write another world level
+  uint24 addr(24h200000);
+  uint24 counter(0);
+
+  always_before {
+    ram.in_ready = 0; // maintain low, pulse high to read/write
+    ram.addr     = addr;
+    ram.wenable  = 1; // we write
+
+    sf.file_request_valid  = 0;
+    // the file offset is always given by the iteration counter
+    sf.file_request_offset = {iter,10b0};
+
+    // if data is received, store in BRAM
+    buffer.wdata      = sf.file_data;
+    buffer.wenable    = sf.file_data_avail;
+    if (sf.file_data_avail) {
+      buffer.addr     = file_recv_count[0,10];
+      file_recv_count = file_recv_count + 1;
+    }
+  }
+
+  algorithm {
+    leds = 4;
+    while (~counter[23,1]) {
+      counter = counter + 1;
+    }
+
+    // another world levels are 2097136 bytes, which takes 2048 1024-byte blocks
+    while (iter != 2048) {
+      // 1024 bytes at each iteration
+      // request some data from the file
+      leds = 1;
+      while (1) {
+        sf.file_request_valid = ~sf.file_request_ready; // start!
+        // wait for SPI file interface to report ready
+        if (sf.file_request_ready) {
+          break;
+        }
+      }
+      ++: // wait one cycle, why?
+      leds = 2;
+
+      // wait for all data to be received
+      while (~file_recv_count[10,1]) { } // == 1024
+      ++: // wait one cycle, why?
+      leds = 0;
+
+      // write to PSRAM
+      buffer.wenable = 0;
+      buffer.addr = 0;
+      n = 0;
+      while (~n[10,1]) {
+        if (~writing) {
+          // write if enabled and addr received
+          ram.in_ready = 1;
+          ram.wdata    = buffer.rdata;
+          writing      = 1;
+        } else {
+          if (~ram.busy) {
+            // done, increment addresses
+            n            = n + 1;
+            buffer.addr  = n;
+            addr         = addr + 1;
+            writing = 0;
+          }
+        }
+      }
+      ++: // wait one cycle, why?
+      // next iteration
+      file_recv_count = 0;
+      iter = iter + 1;
+    }
+  }
+}
