@@ -62,7 +62,7 @@ circuitry readByte(inout mem)
 
 // ---------------------------------------------
 
-$include('data.si')
+// include('data.si')
 
 // ---------------------------------------------
 
@@ -123,10 +123,16 @@ $$end
 
 	bram uint8 data[64] = uninitialized; // TODO: adjust size
 
-  uint17 segBytecode ($segBytecode$);
-  uint17 segPalettes ($segPalettes$);
-  uint17 segCinematic($segCinematic$);
-  uint17 segVideo2   ($segVideo2$);
+  //uint17 segBytecode ($segBytecode$);
+  //uint17 segPalettes ($segPalettes$);
+  //uint17 segCinematic($segCinematic$);
+  //uint17 segVideo2   ($segVideo2$);
+
+  uint$32*4$ segOffsets(0);
+  uint17 segBytecode  <:: 0; //segOffsets[ 0,17]; // TODO: do not store/read
+  uint17 segPalettes  <:: segOffsets[32,17];
+  uint17 segCinematic <:: segOffsets[64,17];
+  uint17 segVideo2    <:: segOffsets[96,17];
 
   uint1  next_palette(1);
 
@@ -354,8 +360,19 @@ $$end
 
     while (mem.busy) {} // will require pressing reset if commented
 
+    // get part offsets from SPIflash
+++:
+    mem.in_ready = 1; // start reading
+    mem.addr     = $(1<<21) - 32$;
+    uint5 n(0);
+    while (~n[4,1]) {
+      segOffsets = {mem.data,segOffsets[8,$32*4-8$]};
+      n = mem.data_available ? (n + 1) : n; // next on receive
+    }
+    mem.in_ready = 0;
+
 $$if SIMULATION then
-    __display("Hello Another World");
+    __display("Hello Another World (offsets: %d,%d,%d,%d)",segBytecode,segPalettes,segCinematic,segVideo2);
 $$end
 
 $$if ENABLE_GAMESTATE_EXPERIMENT then
@@ -657,7 +674,7 @@ $$end
                 case 8h07: {
                   uint16 offset(0);
                   (mem,data,offset) = nextWord(mem,data);
-                  mem.addr      = segBytecode + offset;
+                  mem.addr      = offset + segBytecode;
 $$if SIMULATION then
                   //__display("[%d] op_jmp %x",cycle,offset);
 $$end
