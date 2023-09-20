@@ -105,8 +105,8 @@ $$end
       counter = counter + 1;
     }
 
-    // another world levels are 1681536 bytes, which takes 1643 1024-byte blocks
-    while (iter != 1643) {
+    // another world levels are 2097136 bytes, which takes 2048 1024-byte blocks
+    while (iter != 2048) {
       // 1024 bytes at each iteration
       // request some data from the file
       leds = 1;

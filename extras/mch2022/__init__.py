@@ -74,7 +74,7 @@ def on_action_btn_menu(pressed):
 		#else:
 		#	mch22.lcd_mode(1)
 		#	g_playing = True
-		
+
 def on_action_btn_select(pressed):
 	button_report(1 << 7, pressed)
 
@@ -156,7 +156,7 @@ def load(level):
 	spi_cmd_fread_put = bytearray(0x401)
 	spi_cmd_fread_put[0] = 0xf9
 	with open(getcwd() + "/" + level + ".raw", "rb") as f:
-		for k in range(0, 1643):
+		for k in range(0, 2048): # another world levels are 2097136 bytes, which takes 2048 1024-byte blocks
 			# wait for IRQ
 			while mch22.fpga_transaction(bytes(spi_cmd_nop2))[1] == 0:
 				pass
@@ -172,7 +172,7 @@ def load(level):
 			mch22.fpga_send(bytes(spi_cmd_fread_put))
 
 def start(level):
-	with open(getcwd() + "/" + level + ".bit", "rb") as f:
+	with open(getcwd() + "/bitstream.bit", "rb") as f:
 		mch22.lcd_mode(1)
 		mch22.fpga_load(f.read())
 
