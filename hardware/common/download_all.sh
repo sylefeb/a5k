@@ -34,7 +34,10 @@ wget $OPT $SILICE_URL/projects/spiflash/spiflash2x.si
 wget $OPT $SILICE_URL/projects/common/ddr_clock.v
 wget $OPT $MCH2022_SILICE_URL/common/qpsram2x.si
 wget $OPT $MCH2022_SILICE_URL/common/spi_buttons.v
+wget $OPT $MCH2022_SILICE_URL/common/spi_file.v
 wget $OPT $TINYGPU_URL/hardware/GPUs/dmc-1/parallel_screen.si
 # for spi com with ESP32 on the mch2022 badge
 wget $OPT $MCH2022_ICE40_URL/cores/spi_slave/rtl/spi_dev_core.v
 wget $OPT $MCH2022_ICE40_URL/cores/spi_slave/rtl/spi_dev_proto.v
+wget $OPT $MCH2022_ICE40_URL/cores/spi_slave/rtl/spi_dev_fread.v
+wget $OPT https://raw.githubusercontent.com/no2fpga/no2misc/59350da954e78424117ed01c55b5c7a12e524397/rtl/ram_sdp.v
