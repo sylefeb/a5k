@@ -1,5 +1,7 @@
 # a5k: How I remade Another World / Out of This World in hardware on the UP5K FPGA
 
+**NOTE:** if you are updating please delete your previous files in ROMs/ as these need to be rebuild with the latest version.
+
 > Just want to test?
 >
 > **Simulation:** Checkout the repo, install [Silice](https://github.com/sylefeb/Silice/blob/master/GetStarted.md)
