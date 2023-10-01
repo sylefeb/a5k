@@ -8,6 +8,11 @@ wget $OPT $MCH2022_TOOLS_URL/filesystem_create_directory.py
 wget $OPT $MCH2022_TOOLS_URL/filesystem_push.py
 wget $OPT $MCH2022_TOOLS_URL/filesystem_list.py
 wget $OPT $MCH2022_TOOLS_URL/filesystem_remove.py
+chmod +x webusb.py
+chmod +x filesystem_create_directory.py
+chmod +x filesystem_push.py
+chmod +x filesystem_list.py
+chmod +x filesystem_remove.py
 # ensure paths are not converted under MSYS/MinGW
 export MSYS2_ARG_CONV_EXCL="$MSYS2_ARG_CONV_EXCL;/sd/"
 # Another world directory on mch2022 SD card
