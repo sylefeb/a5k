@@ -64,4 +64,7 @@ build/send.py: build
 
 mch2022prog: build/fpga.py build/write.bin build/send.py
 
+clean:
+	cd hardware/common/ ; git clean -f ; cd -
+
 .PHONY: mch2022prog
