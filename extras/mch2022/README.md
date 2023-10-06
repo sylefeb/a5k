@@ -9,6 +9,8 @@ To install everything on the badge, follow these steps:
 That's it! To play, on the badge go to *apps* and then *another_world*. Select the
 level with the joystick and click on the stick to start it.
 
+> The game can be uninstalled from the badge using `./uninstall_game.sh`
+
 ## Credits
 
 Thanks to Henri Manson for making this possible!
